@@ -21,14 +21,14 @@
   let bgPort = null;
   let isConnectedToServer = false;
 
-  // Cài đặt người dùng (Lưu tối đa 80 câu để cuộn xem toàn bộ hội thoại cuộc họp)
+  // Cài đặt người dùng (Lưu tối đa 150 câu để cuộn xem toàn bộ hội thoại cuộc họp)
   let settings = {
     enabled: true,
     displayMode: "both", // "both" (Song ngữ Cả 2) hoặc "vi_only" (Chỉ Tiếng Việt)
     enableInterim: true,
     fontSize: "medium",  // small, medium, large
     autoFadeSeconds: 0,  // 0 = Không làm mờ chữ, giữ lịch sử rõ ràng để đọc
-    maxCards: 80         // Lưu tới 80 câu để người dùng thoải mái cuộn xem
+    maxCards: 150        // Lưu tới 150 câu để người dùng thoải mái cuộn xem
   };
 
   // Shadow DOM Host & Elements
@@ -36,8 +36,23 @@
   let overlayContainer = null;
   let subtitlesBody = null;
   let statusDot = null;
+  let voiceWaveEl = null;
+  let voiceWaveTimer = null;
   let btnModeToggle = null;
   let btnServerPower = null;
+
+  /**
+   * Kích hoạt hoạt họa sóng âm thanh nhỏ gọn khi có tiếng nói phát ra
+   */
+  function triggerVoiceWave() {
+    if (!voiceWaveEl) return;
+    voiceWaveEl.classList.add("active");
+    if (voiceWaveTimer) clearTimeout(voiceWaveTimer);
+    voiceWaveTimer = setTimeout(() => {
+      if (voiceWaveEl) voiceWaveEl.classList.remove("active");
+      voiceWaveTimer = null;
+    }, 1200);
+  }
 
   function isExtensionValid() {
     try {
@@ -118,39 +133,123 @@
   }
 
   /**
-   * Gửi yêu cầu dịch với cơ chế Dual-Transport (WebSocket Port + HTTP Message Fallback)
+   * Tách câu tiếng Nhật theo ranh giới câu (Sentence Segmentation)
+   * Tách theo các dấu câu: 。！？!? và ký tự xuống dòng
    */
-  function sendTranslationRequest(blockState, type) {
-    if (!settings.enabled || !blockState.lastObservedText || !blockState.lastObservedText.trim()) return;
+  function splitJapaneseSentences(text) {
+    if (!text) return { completed: [], draft: "" };
 
-    const currentText = blockState.lastObservedText.trim();
-    if (/^(mic_none|mic_off|arrow_downward|closed_caption|volume_up|more_vert)\b/i.test(currentText)) return;
-    if (currentText.length === 0) return;
-
-    blockState.activeRequestId++;
-    const currentReqId = blockState.activeRequestId;
-    const now = Date.now();
-
-    let seqToSend = blockState.blockSeq;
-    if (type === "final") {
-      blockState.blockSeq++;
-      seqToSend = blockState.blockSeq;
-      blockState.committedText = currentText;
-      blockState.lastSentInterimText = "";
-    } else {
-      blockState.lastSentInterimText = currentText;
-      seqToSend = blockState.blockSeq + 1;
+    const completed = [];
+    let buffer = "";
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      buffer += ch;
+      if (ch === '。' || ch === '！' || ch === '？' || ch === '!' || ch === '?' || ch === '\n') {
+        const trimmed = buffer.trim();
+        if (trimmed.length > 0) {
+          completed.push(trimmed);
+        }
+        buffer = "";
+      }
     }
+
+    return {
+      completed: completed,
+      draft: buffer.trim()
+    };
+  }
+
+  /**
+   * Kiểm tra tên người nói có hợp lệ không (loại bỏ thán từ, ký tự điều khiển, câu thoại lọt vào)
+   */
+  function isInvalidSpeakerName(name) {
+    if (!name || name.trim().length < 2) return true;
+    const clean = name.trim();
+    // Tên người không bao giờ dài quá 35 ký tự
+    if (clean.length > 35) return true;
+    // Tên người không bao giờ chứa dấu chấm câu hoặc ngắt câu
+    if (/[。！？!?\n\r]/.test(clean)) return true;
+    // Tên người không bao giờ kết thúc bằng dấu phẩy, dấu hai chấm
+    if (/[、,.:;]$/.test(clean)) return true;
+    // Loại bỏ thán từ tiếng Nhật
+    if (/^(あの|えっと|ええと|はい|そう|うん|あー|うーん|えー|いや|まあ)[\sー〜\?？\!！,、]*$/i.test(clean)) return true;
+    // Loại bỏ các đoạn văn bản hệ thống
+    if (/Cuộc gọi này|Chi tiết về cuộc họp|Nhấn vào Mũi tên|presentation audio/i.test(clean)) return true;
+    return false;
+  }
+
+  /**
+   * Tính toán toàn bộ văn bản tiếng Nhật gốc của lượt nói hiện tại
+   */
+  function getFullTurnOriginal(blockState) {
+    if (!blockState) return "";
+    const parts = (blockState.committedSentences || []).map(s => s.original);
+    if (blockState.currentSentenceText) {
+      parts.push(blockState.currentSentenceText);
+    }
+    return parts.join(" ").trim();
+  }
+
+  /**
+   * Tính toán toàn bộ văn bản dịch tiếng Việt của lượt nói hiện tại
+   */
+  function getFullTurnTranslated(blockState) {
+    if (!blockState) return "";
+    const parts = (blockState.committedSentences || []).map(s => s.translated).filter(Boolean);
+    if (blockState.currentSentenceTranslation && blockState.currentSentenceTranslation !== "...") {
+      parts.push(blockState.currentSentenceTranslation);
+    }
+    return parts.join(" ").trim();
+  }
+
+  /**
+   * Kiểm tra tính liên tục của văn bản giữa 2 lần cập nhật DOM của cùng 1 speaker block.
+   * Trả về true nếu 'next' là câu đang tiếp diễn/sửa lỗi từ 'prev'.
+   * Trả về false nếu Google Meet đã cuộn hẳn sang câu hoàn toàn mới.
+   */
+  function checkTextOverlap(prev, next) {
+    if (!prev || !next) return false;
+    if (prev.length < 5 || next.length < 5) return true;
+
+    // Kiểm tra tiền tố chung
+    const minPrefix = Math.min(prev.length, next.length, 6);
+    if (next.startsWith(prev.substring(0, minPrefix)) || prev.startsWith(next.substring(0, minPrefix))) {
+      return true;
+    }
+
+    // Kiểm tra chứa lẫn nhau
+    if (next.includes(prev) || prev.includes(next)) {
+      return true;
+    }
+
+    // Kiểm tra có chung đoạn ký tự độ dài từ 4 trở lên không (nhận diện ASR sửa lỗi giữa chừng)
+    for (let i = 0; i <= prev.length - 4; i += 2) {
+      const sub = prev.substring(i, i + 4);
+      if (next.includes(sub)) return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Gửi yêu cầu dịch một câu cụ thể (Dual-Transport: WebSocket Port + HTTP Message Fallback)
+   */
+  function sendSentenceTranslation(blockState, sentenceText, type) {
+    if (!settings.enabled || !sentenceText || !sentenceText.trim()) return;
+
+    const textToSend = sentenceText.trim();
+    blockState.activeRequestId++;
+    const reqId = blockState.activeRequestId;
 
     const payload = {
       type: type, // "interim" hoặc "final"
       session_id: sessionId,
       block_id: blockState.blockId,
-      req_id: currentReqId,
-      seq: seqToSend,
+      req_id: reqId,
+      seq: reqId,
       speaker: blockState.speaker,
-      text: currentText,
-      timestamp: now
+      text: textToSend,
+      timestamp: Date.now()
     };
 
     let sent = false;
@@ -166,7 +265,6 @@
       }
     }
 
-    // Nếu Port chưa gửi được, Fallback gửi ngay qua sendMessage
     if (!sent && isExtensionValid()) {
       try {
         chrome.runtime.sendMessage({ action: "TRANSLATE", payload: payload }, (res) => {
@@ -179,14 +277,18 @@
     }
 
     console.log(
-      `%c[JA-VI][Gửi dịch ${type.toUpperCase()}]%c [${blockState.speaker}]: "${currentText}"`,
+      `%c[JA-VI][Gửi dịch ${type.toUpperCase()}]%c [${blockState.speaker}]: "${textToSend}"`,
       type === "final" ? "color: #1a73e8; font-weight: bold;" : "color: #fbbc04;",
       "color: inherit;"
     );
   }
 
+  function sendTurnTranslation(blockState, type) {
+    sendSentenceTranslation(blockState, blockState.currentSentenceText, type);
+  }
+
   // =========================================================================
-  // 2. Mô hình State Machine Theo Từng Speaker Block
+  // 2. Mô hình Quản Lý Lượt Nói (Turn-Based State Machine)
   // =========================================================================
 
   const activeBlocks = new Map();
@@ -199,17 +301,16 @@
 
     const state = {
       blockId: blockId,
-      element: element,
-      speaker: initialSpeaker || "Người tham gia",
-      lastObservedText: "",
-      lastSentInterimText: "",
-      committedText: "",
-      activeRequestId: 0,
-      blockSeq: 0,
-      debounceTimer: null,
-      interimTimer: null,
       cardId: cardId,
-      cardElement: null,
+      element: element,
+      speaker: initialSpeaker || "Your Presentation",
+      committedSentences: [], // Danh sách các câu trước đó đã hoàn tất trong cùng một lượt nói [{ original, translated }]
+      currentSentenceText: "",
+      currentSentenceTranslation: "",
+      lastSeenDomText: "",
+      activeRequestId: 0,
+      translateTimer: null,
+      finalSilenceTimer: null,
       isFinalized: false,
       createdAt: Date.now()
     };
@@ -224,17 +325,22 @@
     if (blockState.isFinalized) return;
     blockState.isFinalized = true;
 
-    if (blockState.debounceTimer) {
-      clearTimeout(blockState.debounceTimer);
-      blockState.debounceTimer = null;
+    if (blockState.translateTimer) {
+      clearTimeout(blockState.translateTimer);
+      blockState.translateTimer = null;
     }
-    if (blockState.interimTimer) {
-      clearTimeout(blockState.interimTimer);
-      blockState.interimTimer = null;
+    if (blockState.finalSilenceTimer) {
+      clearTimeout(blockState.finalSilenceTimer);
+      blockState.finalSilenceTimer = null;
     }
 
-    if (blockState.lastObservedText && blockState.lastObservedText !== blockState.committedText) {
-      sendTranslationRequest(blockState, "final");
+    const card = shadowRoot ? shadowRoot.getElementById(blockState.cardId) : null;
+    if (card) {
+      card.classList.remove("interim");
+    }
+
+    if (blockState.currentSentenceText && blockState.currentSentenceText.trim()) {
+      sendSentenceTranslation(blockState, blockState.currentSentenceText, "final");
     }
   }
 
@@ -247,7 +353,7 @@
 
     setTimeout(() => {
       blocksById.delete(blockState.blockId);
-    }, 25000);
+    }, 45000);
   }
 
   // =========================================================================
@@ -261,11 +367,39 @@
    * Tìm vùng chứa phụ đề chính xác của Google Meet
    * Hỗ trợ cuộc họp thông thường, trình bày màn hình (Presentation), và PiP
    */
+  /**
+   * Tìm vùng chứa phụ đề chính xác của Google Meet
+   * Hỗ trợ cuộc họp thông thường, trình bày màn hình (Presentation), và Picture-in-Picture (PiP)
+   */
   function findCaptionContainer() {
-    // 1. ƯU TIÊN SỐ 1: Dynamic Scanner - Tìm container từ các phần tử lá chứa chữ tiếng Nhật thực tế
-    // Đây là phương pháp chắc chắn 100%, miễn nhiễm hoàn toàn với mọi thay đổi class name của Google Meet
+    // 1. ƯU TIÊN SỐ 1: Trực tiếp tìm qua phần tử dòng phụ đề của Google Meet (.iTTPOb, [jsname="tgaKEf"])
+    const lineEl = document.querySelector('.iTTPOb, [jsname="tgaKEf"]');
+    if (lineEl && !lineEl.closest("#gmeet-trans-host")) {
+      const container = lineEl.closest(".a4bvKc") || lineEl.closest(".nMDOkf")?.parentElement || lineEl.parentElement;
+      if (container && container !== document.body) {
+        return container;
+      }
+    }
+
+    // 2. ƯU TIÊN SỐ 2: Tìm qua speaker row (.nMDOkf, [jsname="YSxPC"]) của Google Meet
+    const rowEl = document.querySelector('.nMDOkf, [jsname="YSxPC"]');
+    if (rowEl && !rowEl.closest("#gmeet-trans-host")) {
+      const container = rowEl.closest(".a4bvKc") || rowEl.parentElement;
+      if (container && container !== document.body) {
+        return container;
+      }
+    }
+
+    // 3. ƯU TIÊN SỐ 3: Container rỗng chuẩn của Google Meet (.a4bvKc)
+    const staticPrimary = document.querySelector(".a4bvKc");
+    if (staticPrimary && !staticPrimary.closest("#gmeet-trans-host") && !staticPrimary.closest('[role="toolbar"]')) {
+      return staticPrimary;
+    }
+
+    // 4. ƯU TIÊN SỐ 4: Dynamic Scanner - Tìm phần tử lá chứa chữ tiếng Nhật thực tế
+    // Tự động nhận diện phụ đề trong mọi biến thể giao diện Meet (kể cả khi đổi class name hay mở PiP)
     const allLeafs = Array.from(
-      document.querySelectorAll('body *:not(script):not(style):not(dialog):not([role="dialog"]):not([role="menu"])')
+      document.querySelectorAll('body *:not(script):not(style)')
     ).filter((el) => {
       if (el.closest("#gmeet-trans-host")) return false;
       if (el.closest('button, [role="button"], [role="toolbar"], [role="menu"], [role="tooltip"], [tooltip-id]')) return false;
@@ -275,11 +409,10 @@
       const hasJaChild = Array.from(el.children).some(child => JA_REGEX.test(child.textContent || ""));
       if (hasJaChild) return false;
       const rect = el.getBoundingClientRect();
-      return rect.height > 4 && rect.width > 4;
+      return rect.height > 2 && rect.width > 2;
     });
 
     if (allLeafs.length > 0) {
-      // Tìm container chung thấp nhất bao bọc tất cả các dòng phụ đề tiếng Nhật đang có
       let container = allLeafs[0].parentElement;
       while (container && container !== document.body) {
         if (container.classList.contains("a4bvKc") || container.getAttribute("role") === "region") {
@@ -291,40 +424,9 @@
         }
         container = container.parentElement;
       }
-      // Dự phòng: lấy cha gần nhất của leaf đầu tiên
       const candidate = allLeafs[0].closest(".a4bvKc, .nMDOkf");
       if (candidate) return candidate.parentElement || candidate;
       return allLeafs[0].parentElement;
-    }
-
-    // 2. Dự phòng khi chưa có ai nói: Container rỗng chuẩn của Google Meet (.a4bvKc)
-    // TUYỆT ĐỐI KHÔNG chọn các nút bấm / thanh công cụ ở thanh điều khiển dưới đáy
-    const staticPrimary = document.querySelector(".a4bvKc");
-    if (staticPrimary && 
-        !staticPrimary.closest("#gmeet-trans-host") && 
-        !staticPrimary.closest('[role="dialog"]') &&
-        !staticPrimary.closest('[role="toolbar"]') &&
-        !staticPrimary.hasAttribute("tooltip-id") &&
-        !staticPrimary.querySelector('[tooltip-id^="ucc"]')) {
-      return staticPrimary;
-    }
-
-    // 3. Tìm qua line element phụ đề (.iTTPOb, [jsname="tgaKEf"])
-    const lineEl = document.querySelector('.iTTPOb, [jsname="tgaKEf"]');
-    if (lineEl && !lineEl.closest("#gmeet-trans-host") && !lineEl.closest('[role="dialog"]')) {
-      const container = lineEl.closest(".a4bvKc") || lineEl.closest(".nMDOkf")?.parentElement || lineEl.parentElement;
-      if (container && container !== document.body && !container.closest('[role="dialog"]') && !container.querySelector('[tooltip-id^="ucc"]')) {
-        return container;
-      }
-    }
-
-    // 4. Tìm qua hàng speaker đặc trưng của Google Meet (.nMDOkf, [jsname="YSxPC"])
-    const rowEl = document.querySelector('.nMDOkf, [jsname="YSxPC"]');
-    if (rowEl && !rowEl.closest("#gmeet-trans-host") && !rowEl.closest('[role="dialog"]')) {
-      const parent = rowEl.closest(".a4bvKc") || rowEl.parentElement;
-      if (parent && parent !== document.body && !parent.closest('[role="dialog"]') && !parent.querySelector('[tooltip-id^="ucc"]')) {
-        return parent;
-      }
     }
 
     // 5. Region phụ đề rõ ràng
@@ -336,7 +438,7 @@
     ];
     for (const sel of regionSelectors) {
       const el = document.querySelector(sel);
-      if (el && !el.closest("#gmeet-trans-host") && !el.closest('[role="dialog"]') && !el.querySelector('[tooltip-id^="ucc"]')) {
+      if (el && !el.closest("#gmeet-trans-host") && !el.closest('[role="toolbar"]')) {
         return el;
       }
     }
@@ -345,32 +447,64 @@
   }
 
   /**
-   * Lấy danh sách các Speaker Block con trực tiếp từ Caption Container (Kiến trúc chuẩn Bug B)
+   * Lấy danh sách các Speaker Block con trực tiếp từ Caption Container
+   * Ưu tiên tìm các thẻ hàng speaker riêng biệt (.nMDOkf, [jsname="YSxPC"]) để không gộp nhiều người nói vào 1
    */
   function getBlockList(container) {
     if (!container || container === document.body) return [];
 
+    // Nếu chính container là một speaker row (.nMDOkf) hoặc line phụ đề (.iTTPOb)
+    if (container.matches && (container.matches('.nMDOkf, [jsname="YSxPC"]') || container.matches('.iTTPOb, [jsname="tgaKEf"]'))) {
+      return [container];
+    }
+
+    // 1. ƯU TIÊN SỐ 1: Tìm tất cả các dòng speaker riêng biệt (.nMDOkf, [jsname="YSxPC"])
+    const speakerRows = Array.from(container.querySelectorAll('.nMDOkf, [jsname="YSxPC"]')).filter(
+      el => !(el.closest && el.closest('#gmeet-trans-host')) && 
+            !el.closest('button, [role="button"], [role="toolbar"], [role="menu"]') && 
+            el.offsetHeight > 0
+    );
+    if (speakerRows.length > 0) {
+      return speakerRows;
+    }
+
+    // 2. ƯU TIÊN SỐ 2: Tìm các phần tử dòng phụ đề (.iTTPOb, [jsname="tgaKEf"])
+    const captionLines = Array.from(container.querySelectorAll('.iTTPOb, [jsname="tgaKEf"]')).filter(
+      el => !(el.closest && el.closest('#gmeet-trans-host')) && 
+            !el.closest('button, [role="button"], [role="toolbar"], [role="menu"]') && 
+            el.offsetHeight > 0
+    );
+    if (captionLines.length > 0) {
+      return captionLines;
+    }
+
+    // 3. Dự phòng: Duyệt các phần tử con trực tiếp của container
     let list = Array.from(container.children).filter(
       c => !(c.closest && c.closest('#gmeet-trans-host')) && 
-           !c.closest('[role="dialog"]') && 
-           !c.closest('[role="menu"]') &&
-           !c.closest('[role="toolbar"]') &&
-           !c.hasAttribute('tooltip-id') &&
-           !c.querySelector('[tooltip-id^="ucc"]') &&
-           c.getAttribute('role') !== 'button' &&
+           !c.closest('[role="menu"]') && 
+           !c.closest('[role="toolbar"]') && 
+           !c.hasAttribute('tooltip-id') && 
+           !c.querySelector('[tooltip-id^="ucc"]') && 
+           c.getAttribute('role') !== 'button' && 
            c.offsetHeight > 0
     );
 
     // Nếu container có 1 wrapper trung gian bọc ngoài
     if (list.length === 1 && list[0].children && list[0].children.length > 1) {
+      const innerRows = Array.from(list[0].querySelectorAll('.nMDOkf, [jsname="YSxPC"], .iTTPOb, [jsname="tgaKEf"]')).filter(
+        el => !(el.closest && el.closest('#gmeet-trans-host')) && 
+              !el.closest('button, [role="button"], [role="toolbar"], [role="menu"]') && 
+              el.offsetHeight > 0
+      );
+      if (innerRows.length > 0) return innerRows;
+
       const innerList = Array.from(list[0].children).filter(
         c => !(c.closest && c.closest('#gmeet-trans-host')) && 
-             !c.closest('[role="dialog"]') && 
-             !c.closest('[role="menu"]') &&
-             !c.closest('[role="toolbar"]') &&
-             !c.hasAttribute('tooltip-id') &&
-             !c.querySelector('[tooltip-id^="ucc"]') &&
-             c.getAttribute('role') !== 'button' &&
+             !c.closest('[role="menu"]') && 
+             !c.closest('[role="toolbar"]') && 
+             !c.hasAttribute('tooltip-id') && 
+             !c.querySelector('[tooltip-id^="ucc"]') && 
+             c.getAttribute('role') !== 'button' && 
              c.offsetHeight > 0
       );
       if (innerList.length > 0) return innerList;
@@ -390,44 +524,59 @@
    * Tuyệt đối không để lọt rác mã nguồn / script hoặc menu hệ thống vào câu phụ đề.
    */
   function extractBlockData(blockElement) {
-    if (!blockElement) return { speaker: "Người tham gia", text: "" };
+    if (!blockElement) return { speaker: "Your Presentation", text: "" };
 
     // Bảo vệ: Bỏ qua ngay nếu là nút điều khiển hoặc thanh công cụ
     if (blockElement.hasAttribute && (blockElement.hasAttribute('tooltip-id') || blockElement.closest('[role="toolbar"]'))) {
-      return { speaker: "Người tham gia", text: "" };
+      return { speaker: "Your Presentation", text: "" };
     }
+
+    // 1. Xác định trước phần tử dòng phụ đề để tuyệt đối không nhầm phụ đề thành tên người nói
+    const captionEl = blockElement.matches && blockElement.matches('.iTTPOb, [jsname="tgaKEf"]') 
+      ? blockElement 
+      : blockElement.querySelector('.iTTPOb, [jsname="tgaKEf"]');
 
     let speakerName = "";
 
-    // 1. Thử lấy tên từ ảnh avatar (img alt)
-    const avatarImg = blockElement.querySelector('img[alt]');
-    if (avatarImg && avatarImg.alt && avatarImg.alt.trim()) {
-      speakerName = avatarImg.alt.trim();
-    }
+    const searchRoot = (blockElement.closest && blockElement.closest('.nMDOkf, [jsname="YSxPC"]')) || blockElement;
 
-    // 2. Thử lấy tên từ các phần tử chuẩn của Meet
-    if (!speakerName) {
-      const nameEl = blockElement.querySelector('[jsname="W297wb"], .ygicle, [data-self-name], [class*="speaker" i]');
-      if (nameEl && nameEl.textContent.trim()) {
-        speakerName = nameEl.textContent.trim();
+    // 2. Thử lấy tên từ ảnh avatar (img[alt])
+    const avatarImg = searchRoot.querySelector('img[alt]');
+    if (avatarImg && avatarImg.alt && avatarImg.alt.trim()) {
+      const candidate = avatarImg.alt.trim();
+      if (!isInvalidSpeakerName(candidate)) {
+        speakerName = candidate;
       }
     }
 
-    // 3. Nhận diện trường hợp Bản trình bày / Share màn hình kèm tiếng
-    const rawBlockText = blockElement.textContent || "";
+    // 3. Thử lấy tên từ các phần tử chứa tên chuẩn của Meet (loại trừ captionEl và các phần tử con của nó)
+    if (!speakerName) {
+      const nameCandidates = Array.from(searchRoot.querySelectorAll('[jsname="W297wb"], [data-self-name], .zsDr5d, .adEfZc'));
+      for (const el of nameCandidates) {
+        if (captionEl && (el === captionEl || el.contains(captionEl) || captionEl.contains(el))) continue;
+        const candidate = el.textContent.trim();
+        if (!isInvalidSpeakerName(candidate)) {
+          speakerName = candidate;
+          break;
+        }
+      }
+    }
+
+    // 4. Nhận diện trường hợp Bản trình bày / Share màn hình kèm tiếng
+    const rawBlockText = searchRoot.textContent || "";
     if (!speakerName) {
       if (/Bản trình bày của bạn|Your presentation|プレゼンテーション/i.test(rawBlockText)) {
         speakerName = "Your Presentation";
       }
     }
 
+    if (!speakerName || isInvalidSpeakerName(speakerName)) {
+      speakerName = "Your Presentation";
+    }
+
     let text = "";
 
-    // 4. ƯU TIÊN SỐ 1: Bóc tách trực tiếp từ phần tử chứa dòng phụ đề của Meet (.iTTPOb, [jsname="tgaKEf"])
-    const captionEl = blockElement.matches && blockElement.matches('.iTTPOb, [jsname="tgaKEf"]') 
-      ? blockElement 
-      : blockElement.querySelector('.iTTPOb, [jsname="tgaKEf"]');
-
+    // 5. Bóc tách trực tiếp từ phần tử chứa dòng phụ đề của Meet (captionEl)
     if (captionEl) {
       text = (captionEl.innerText || captionEl.textContent || "").trim();
     } else {
@@ -438,7 +587,7 @@
         // Tìm trực tiếp từ các phần tử lá chứa chữ Nhật bên trong blockElement (Bảo đảm 100% không trượt)
         const jaLeafs = Array.from(blockElement.querySelectorAll('*')).filter(el => 
           el.children.length === 0 && 
-          JA_REGEX.test(el.textContent || "") &&
+          JA_REGEX.test(el.textContent || "") && 
           !el.closest('button, [role="button"], script, style, [role="dialog"], [role="menu"], [tooltip-id]')
         );
 
@@ -466,33 +615,33 @@
     }
 
     // 7. BỘ LỌC BẢO VỆ CHỐNG RÁC HỆ THỐNG / SCRIPT NHÚNG:
-    // Phụ đề là câu nói ngắn (dưới 800 ký tự), không bao giờ là mã nguồn hoặc danh sách cài đặt
     if (!text || text.length > 800 || text.length < 1) {
-      return { speaker: speakerName || "Người tham gia", text: "" };
+      return { speaker: speakerName, text: "" };
     }
     if (/Cuộc gọi này|Chi tiết về cuộc họp|Nhấn vào Mũi tên|window\.wiz|AF_initData|Tiếng Ả Rập|Trò chuyện với|Mở phần cài đặt|Bản trình bày của bạnBạn đang|Một tiện ích bổ sung|Tùy chọn khác|Rời khỏi cuộc gọi/i.test(text)) {
-      return { speaker: speakerName || "Người tham gia", text: "" };
+      return { speaker: speakerName, text: "" };
     }
     if (!JA_REGEX.test(text)) {
-      return { speaker: speakerName || "Người tham gia", text: "" };
+      return { speaker: speakerName, text: "" };
     }
 
     return {
-      speaker: speakerName || "Người tham gia",
+      speaker: speakerName,
       text: text
     };
   }
 
   /**
-   * Xử lý thay đổi dữ liệu trong một Speaker Block (Đã khắc phục hoàn toàn Bug A & Lưu lịch sử cuộn)
+   * Xử lý thay đổi dữ liệu trong một Speaker Block
+   * Giữ trọn vẹn lời nói liên tục theo từng lượt nói (Turn-Taking), không cắt vụn câu dở
    */
   function handleBlockMutation(blockElement) {
     const { speaker, text } = extractBlockData(blockElement);
 
-    // Nếu text trống: chốt câu cũ nếu đang có
+    // Nếu text trống: chốt lượt nói nếu đang mở
     if (!text || !text.trim() || text.length === 0) {
       const existingState = activeBlocks.get(blockElement);
-      if (existingState && existingState.lastObservedText && !existingState.isFinalized) {
+      if (existingState && !existingState.isFinalized) {
         finalizeBlock(existingState);
       }
       return;
@@ -503,96 +652,89 @@
       return;
     }
 
+    // Kích hoạt hiệu ứng sóng âm thanh trên thanh tiêu đề
+    triggerVoiceWave();
+
     let blockState = activeBlocks.get(blockElement);
 
     if (!blockState) {
       blockState = createBlockState(blockElement, speaker);
     } else if (blockState.isFinalized) {
-      // FIX LỖI A: Mở khóa cờ isFinalized và tạo Card mới để lưu lại thẻ câu cũ trong lịch sử cuộn
-      blockCounter++;
-      const newBlockId = `blk_${blockCounter}_${Date.now().toString(36)}`;
-      blockState.blockId = newBlockId;
-      blockState.cardId = `sub-card-${newBlockId}`;
-      blockState.cardElement = null;
-      blockState.isFinalized = false;
-      blockState.blockSeq = 0;
-      blockState.activeRequestId = 0;
-      blockState.committedText = "";
-      blockState.lastObservedText = "";
-      blockState.lastSentInterimText = "";
-      if (speaker && speaker !== "Người tham gia") {
-        blockState.speaker = speaker;
-      }
-      blocksById.set(newBlockId, blockState);
-    } else {
-      // Kiểm tra xem Meet có thay thế trực tiếp phụ đề mới mà không clear DOM không
-      const prevText = blockState.lastObservedText;
-      const isCompletelyNewText = prevText &&
-        blockState.committedText &&
-        prevText.length >= 6 &&
-        !text.includes(prevText.substring(0, Math.min(6, prevText.length))) &&
-        !prevText.includes(text.substring(0, Math.min(6, text.length)));
-
-      if (isCompletelyNewText) {
-        finalizeBlock(blockState);
-        blockCounter++;
-        const newBlockId = `blk_${blockCounter}_${Date.now().toString(36)}`;
-        blockState.blockId = newBlockId;
-        blockState.cardId = `sub-card-${newBlockId}`;
-        blockState.cardElement = null;
-        blockState.isFinalized = false;
-        blockState.blockSeq = 0;
-        blockState.activeRequestId = 0;
-        blockState.committedText = "";
-        blockState.lastObservedText = "";
-        blockState.lastSentInterimText = "";
-        if (speaker && speaker !== "Người tham gia") {
-          blockState.speaker = speaker;
-        }
-        blocksById.set(newBlockId, blockState);
-      } else if (speaker && speaker !== "Người tham gia" && blockState.speaker === "Người tham gia") {
-        blockState.speaker = speaker;
-        updateCardSpeaker(blockState);
-      }
+      // Lượt nói trước đã chốt sau 5s yên lặng, mở thẻ mới cho lượt nói tiếp theo
+      blockState = createBlockState(blockElement, speaker);
+    } else if (speaker && speaker !== "Your Presentation" && blockState.speaker !== "Your Presentation" && blockState.speaker !== speaker) {
+      // Đổi người nói: User B xen vào User A -> chốt lượt User A, mở lượt cho User B
+      finalizeBlock(blockState);
+      blockState = createBlockState(blockElement, speaker);
+    } else if (speaker && speaker !== "Your Presentation" && blockState.speaker === "Your Presentation") {
+      blockState.speaker = speaker;
+      updateCardSpeaker(blockState);
     }
 
-    if (text === blockState.lastObservedText) return;
+    // So sánh với text DOM lần trước
+    const prevDom = blockState.lastSeenDomText || "";
+    if (text === prevDom) return;
 
-    // Log luồng chính: Bắt được phụ đề tiếng Nhật mới
+    // Kiểm tra xem Meet có cuộn sang câu mới của cùng 1 người nói hay không
+    if (!checkTextOverlap(prevDom, text)) {
+      // Google Meet cuộn sang câu tiếp theo -> lưu câu cũ vào committedSentences của thẻ hiện tại
+      const lastTranslated = blockState.currentSentenceTranslation || "";
+      blockState.committedSentences.push({
+        original: prevDom,
+        translated: lastTranslated
+      });
+
+      if (!lastTranslated) {
+        sendSentenceTranslation(blockState, prevDom, "final");
+      }
+
+      // Nếu monologue đã quá 250 ký tự, ngắt thẻ mới để UI không bị quá dài
+      const totalLen = blockState.committedSentences.reduce((sum, s) => sum + s.original.length, 0);
+      if (totalLen > 250) {
+        finalizeBlock(blockState);
+        blockState = createBlockState(blockElement, speaker);
+      } else {
+        // Tiếp tục trên CÙNG THẺ HIỆN TẠI!
+        blockState.currentSentenceText = text;
+        blockState.currentSentenceTranslation = "";
+      }
+    } else {
+      // Nối tiếp hoặc sửa lỗi câu hiện tại
+      blockState.currentSentenceText = text;
+    }
+
+    blockState.lastSeenDomText = text;
+
+    // Log luồng chính: Nhận văn bản phụ đề đang cập nhật
     console.log(
       `%c[JA-VI][Nhận phụ đề]%c [${blockState.speaker}]: "${text}"`,
       "color: #ea8600; font-weight: bold;",
       "color: inherit;"
     );
 
-    blockState.lastObservedText = text;
-    blockState.lastUpdatedAt = Date.now();
+    // Cập nhật câu tiếng Nhật đầy đủ lên thẻ hiện tại ngay lập tức
+    const fullOriginal = getFullTurnOriginal(blockState);
+    const fullTranslated = getFullTurnTranslated(blockState) || "...";
+    renderCard(blockState.cardId, blockState.speaker, fullOriginal, fullTranslated, "interim");
 
-    // Hiển thị / cập nhật thẻ trên UI với câu gốc tiếng Nhật ngay lập tức
-    getOrCreateOverlayCard(blockState, text);
-
-    // Gửi bản dịch nháp (Interim)
-    if (settings.enableInterim) {
-      const charDiff = Math.abs(text.length - blockState.lastSentInterimText.length);
-      if (text.length >= 3 && charDiff >= 2) {
-        if (blockState.interimTimer) clearTimeout(blockState.interimTimer);
-        blockState.interimTimer = setTimeout(() => {
-          blockState.interimTimer = null;
-          if (blockState.lastObservedText === text && !blockState.isFinalized) {
-            sendTranslationRequest(blockState, "interim");
-          }
-        }, 280);
+    // 1. Debounce gửi bản dịch (380ms sau khi người nói tạm nghỉ giữa câu)
+    if (blockState.translateTimer) clearTimeout(blockState.translateTimer);
+    blockState.translateTimer = setTimeout(() => {
+      blockState.translateTimer = null;
+      if (!blockState.isFinalized && blockState.currentSentenceText === text) {
+        sendSentenceTranslation(blockState, blockState.currentSentenceText, "interim");
       }
-    }
+    }, 380);
 
-    // Đặt Debounce chốt câu (Final) cho riêng block này
-    if (blockState.debounceTimer) clearTimeout(blockState.debounceTimer);
-    blockState.debounceTimer = setTimeout(() => {
-      blockState.debounceTimer = null;
-      if (blockState.lastObservedText && !blockState.isFinalized) {
-        sendTranslationRequest(blockState, "final");
+    // 2. Debounce chốt lượt nói khi người nói ngừng nói hẳn (5000ms = 5 giây)
+    // Người A dù ngưng 1-3s để thở hoặc nghĩ từ thì câu vẫn nằm trọn trong 1 thẻ, không tách dòng lắt nhắt
+    if (blockState.finalSilenceTimer) clearTimeout(blockState.finalSilenceTimer);
+    blockState.finalSilenceTimer = setTimeout(() => {
+      blockState.finalSilenceTimer = null;
+      if (!blockState.isFinalized) {
+        finalizeBlock(blockState);
       }
-    }, 450);
+    }, 5000);
   }
 
   /**
@@ -642,41 +784,40 @@
     scanAllBlocks(container);
   }
 
-  // Theo dõi DOM theo sự kiện (Event-Driven) - Thay thế hoàn toàn vòng lặp polling mỗi giây
+  // Theo dõi DOM theo sự kiện (Event-Driven) - Tự động phát hiện và gắn kết container phụ đề
   let rootObserver = null;
   let domCheckTimeout = null;
 
-  function initCaptionWatcher() {
-    // 1. Kiểm tra ngay nếu container phụ đề đã có sẵn trên trang
-    const initialContainer = findCaptionContainer();
-    if (initialContainer) {
-      attachObserver(initialContainer);
+  function checkAndAttachContainer() {
+    if (!isExtensionValid()) return;
+
+    // Tìm container phụ đề tốt nhất hiện có trên trang
+    const bestContainer = findCaptionContainer();
+
+    if (bestContainer) {
+      // Nếu chưa theo dõi container nào, hoặc container tốt nhất khác với container đang theo dõi
+      if (bestContainer !== observedContainer) {
+        attachObserver(bestContainer);
+      }
+    } else if (observedContainer && !document.body.contains(observedContainer)) {
+      if (mainObserver) {
+        mainObserver.disconnect();
+        mainObserver = null;
+      }
+      observedContainer = null;
     }
+  }
+
+  function initCaptionWatcher() {
+    // 1. Kiểm tra ngay khi khởi tạo
+    checkAndAttachContainer();
 
     // 2. Theo dõi biến đổi DOM của trang (MutationObserver)
-    // Chỉ kích hoạt khi Google Meet thực sự thêm/sửa DOM, không chạy vô ích mỗi giây
     rootObserver = new MutationObserver(() => {
       if (domCheckTimeout) return;
       domCheckTimeout = setTimeout(() => {
         domCheckTimeout = null;
-        if (!isExtensionValid()) return;
-
-        // Nếu container hiện tại bị gỡ khỏi DOM (ví dụ user tắt CC)
-        if (observedContainer && !document.body.contains(observedContainer)) {
-          if (mainObserver) {
-            mainObserver.disconnect();
-            mainObserver = null;
-          }
-          observedContainer = null;
-        }
-
-        // Nếu chưa có container đang theo dõi, thử tìm container
-        if (!observedContainer) {
-          const container = findCaptionContainer();
-          if (container) {
-            attachObserver(container);
-          }
-        }
+        checkAndAttachContainer();
       }, 250);
     });
 
@@ -685,21 +826,14 @@
       subtree: true
     });
 
-    // 3. Watchdog dự phòng chạy chậm (4 giây / lần) hoàn toàn im lặng, không ghi log
-    // Chỉ chạy kiểm tra khi chưa tìm thấy container
+    // 3. Watchdog định kỳ 2 giây (đảm bảo bắt kịp khi Meet đổi sang PiP hoặc chia sẻ màn hình)
     setInterval(() => {
-      if (!isExtensionValid()) return;
-      if (!observedContainer || !document.body.contains(observedContainer)) {
-        const container = findCaptionContainer();
-        if (container && container !== observedContainer) {
-          attachObserver(container);
-        }
-      }
-    }, 4000);
+      checkAndAttachContainer();
+    }, 2000);
   }
 
   // =========================================================================
-  // 4. Quản Lý Thẻ Overlay UI & Cơ Chế Cuộn Thông Minh (Smart Auto-Scroll)
+  // 4. Quản Lý Thẻ Overlay UI, Nút Sao Chép & Cơ Chế Cuộn Thông Minh (Smart Auto-Scroll)
   // =========================================================================
 
   /**
@@ -719,72 +853,98 @@
   }
 
   /**
-   * Lấy hoặc tạo thẻ phụ đề trên Overlay UI - ĐẢM BẢO LUÔN CÓ TEXT GỐC
+   * Hiển thị hoặc cập nhật thẻ phụ đề trên Overlay UI
+   * Tích hợp hàng bản dịch (.translated-row) và nút Sao chép (.card-copy-btn)
    */
-  function getOrCreateOverlayCard(blockState, text) {
+  function renderCard(cardId, speaker, originalText, translatedText, type = "final", latencyMs = null) {
     if (!subtitlesBody || !shadowRoot) return null;
 
-    let card = shadowRoot.getElementById(blockState.cardId);
+    let card = shadowRoot.getElementById(cardId);
+    const latencyLabel = latencyMs !== null ? `${latencyMs}ms` : (type === "interim" ? "⚡ Đang dịch..." : "...");
+
     if (!card) {
       card = document.createElement("div");
-      card.className = "subtitle-card interim";
-      card.id = blockState.cardId;
+      card.className = `subtitle-card ${type === "interim" ? "interim" : ""}`;
+      card.id = cardId;
       card.innerHTML = `
         <div class="subtitle-meta">
-          <span class="speaker-label">${escapeHtml(blockState.speaker)}</span>
-          <span class="latency-label">⚡ Đang dịch...</span>
+          <span class="speaker-label">${escapeHtml(speaker)}</span>
+          <span class="latency-label">${latencyLabel}</span>
         </div>
-        <div class="original-text">${escapeHtml(text)}</div>
-        <div class="translated-text">...</div>
+        <div class="original-text">${escapeHtml(originalText || "")}</div>
+        <div class="translated-row">
+          <div class="translated-text">${escapeHtml(translatedText || "...")}</div>
+          <button class="card-copy-btn" title="Sao chép bản dịch" type="button">📋</button>
+        </div>
       `;
       subtitlesBody.appendChild(card);
-      blockState.cardElement = card;
       scrollSubtitlesToBottom(false);
       trimOldCards();
 
       // CƠ CHẾ ACTIVE RETRY: Nếu sau 2.5s mà vẫn còn "...", kích hoạt ngay Fallback HTTP trực tiếp!
-      setTimeout(() => {
-        if (card && card.parentElement) {
-          const transEl = card.querySelector(".translated-text");
-          if (transEl && transEl.textContent === "...") {
-            console.log(`[JA-VI] Tự động kích hoạt Fallback HTTP cho thẻ [${blockState.blockId}]`);
-            if (isExtensionValid()) {
-              chrome.runtime.sendMessage({
-                action: "TRANSLATE",
-                payload: {
-                  type: "final",
-                  session_id: sessionId,
-                  block_id: blockState.blockId,
-                  req_id: blockState.activeRequestId,
-                  seq: blockState.blockSeq || 1,
-                  speaker: blockState.speaker,
-                  text: blockState.lastObservedText || text,
-                  timestamp: Date.now()
-                }
-              }, (res) => {
-                if (res && res.data) {
-                  handleTranslationResult(res.data);
-                }
-              });
+      if (type === "final") {
+        setTimeout(() => {
+          if (card && card.parentElement) {
+            const transEl = card.querySelector(".translated-text");
+            if (transEl && transEl.textContent === "...") {
+              console.log(`[JA-VI] Tự động kích hoạt Fallback HTTP cho thẻ [${cardId}]`);
+              if (isExtensionValid()) {
+                const blockId = cardId.replace(/^sub-card-/, "");
+                chrome.runtime.sendMessage({
+                  action: "TRANSLATE",
+                  payload: {
+                    type: "final",
+                    session_id: sessionId,
+                    block_id: blockId,
+                    req_id: 1,
+                    seq: 1,
+                    speaker: speaker,
+                    text: originalText,
+                    timestamp: Date.now()
+                  }
+                }, (res) => {
+                  if (res && res.data) {
+                    handleTranslationResult(res.data);
+                  }
+                });
+              }
             }
           }
-        }
-      }, 2500);
+        }, 2500);
 
-      // Timeout an toàn gỡ nhãn "Đang dịch..." nếu mạng bị mất
-      setTimeout(() => {
-        if (card && card.parentElement) {
-          const lat = card.querySelector(".latency-label");
-          if (lat && lat.textContent.includes("Đang dịch...")) {
-            lat.textContent = "AI";
+        // Timeout an toàn gỡ nhãn "Đang dịch..." nếu mạng bị mất
+        setTimeout(() => {
+          if (card && card.parentElement) {
+            const lat = card.querySelector(".latency-label");
+            if (lat && lat.textContent.includes("...")) {
+              lat.textContent = "AI";
+            }
           }
-        }
-      }, 8000);
+        }, 8000);
+      }
     } else {
+      if (type === "final") {
+        card.classList.remove("interim");
+      } else {
+        card.classList.add("interim");
+      }
+
       const origEl = card.querySelector(".original-text");
-      if (origEl && text) origEl.textContent = text;
+      if (origEl && originalText) origEl.textContent = originalText;
+
       const spEl = card.querySelector(".speaker-label");
-      if (spEl && blockState.speaker) spEl.textContent = blockState.speaker;
+      if (spEl && speaker) spEl.textContent = speaker;
+
+      const transEl = card.querySelector(".translated-text");
+      if (transEl && translatedText && translatedText !== "...") {
+        transEl.textContent = translatedText;
+      }
+
+      const latencyEl = card.querySelector(".latency-label");
+      if (latencyEl && latencyLabel) {
+        latencyEl.textContent = latencyLabel;
+      }
+
       scrollSubtitlesToBottom(false);
     }
 
@@ -809,11 +969,33 @@
 
     // Kiểm tra Stale Response
     const blockState = blocksById.get(block_id);
+    if (blockState && type === "interim") {
+      if (blockState.isFinalized || (req_id && req_id < blockState.activeRequestId)) {
+        return;
+      }
+    }
+
     if (blockState) {
-      if (type === "interim") {
-        if (blockState.isFinalized || (req_id && req_id < blockState.activeRequestId)) {
-          return;
+      // 1. Cập nhật vào committedSentences nếu bản dịch này thuộc về câu đã lưu trước đó
+      if (blockState.committedSentences && blockState.committedSentences.length > 0) {
+        for (const item of blockState.committedSentences) {
+          if (!item.translated || item.translated === "..." || item.translated.includes("Đang dịch")) {
+            if (item.original === original_text || original_text.includes(item.original) || item.original.includes(original_text)) {
+              item.translated = translated_text;
+              break;
+            }
+          }
         }
+      }
+
+      // 2. Cập nhật câu hiện tại đang nói nếu khớp
+      if (blockState.currentSentenceText === original_text || 
+          (original_text && blockState.currentSentenceText && (
+            blockState.currentSentenceText.includes(original_text) || original_text.includes(blockState.currentSentenceText)
+          ))) {
+        blockState.currentSentenceTranslation = translated_text;
+      } else if (!blockState.currentSentenceTranslation) {
+        blockState.currentSentenceTranslation = translated_text;
       }
     }
 
@@ -821,38 +1003,32 @@
     let card = shadowRoot.getElementById(cardId);
 
     const ms = (typeof processing_time_ms === "number" && !isNaN(processing_time_ms)) ? Math.round(processing_time_ms) : 0;
-    const displaySpeaker = speaker || (blockState ? blockState.speaker : "Người tham gia");
+    const displaySpeaker = speaker || (blockState ? blockState.speaker : "Your Presentation");
+
+    const fullOriginal = blockState ? getFullTurnOriginal(blockState) : (original_text || "");
+    const fullTranslated = blockState ? getFullTurnTranslated(blockState) : translated_text;
 
     if (card) {
       if (type === "final") {
         card.classList.remove("interim");
       }
       const transEl = card.querySelector(".translated-text");
-      if (transEl) transEl.textContent = translated_text;
+      if (transEl) transEl.textContent = fullTranslated || translated_text;
 
       const origEl = card.querySelector(".original-text");
-      if (origEl && original_text) origEl.textContent = original_text;
+      if (origEl && fullOriginal) origEl.textContent = fullOriginal;
 
       const spEl = card.querySelector(".speaker-label");
-      if (spEl) spEl.textContent = displaySpeaker;
+      if (spEl && displaySpeaker) spEl.textContent = displaySpeaker;
 
       const latencyEl = card.querySelector(".latency-label");
       if (latencyEl) {
         latencyEl.textContent = `${ms}ms`;
       }
     } else {
-      card = document.createElement("div");
-      card.className = `subtitle-card ${type === "interim" ? "interim" : ""}`;
-      card.id = cardId;
-      card.innerHTML = `
-        <div class="subtitle-meta">
-          <span class="speaker-label">${escapeHtml(displaySpeaker)}</span>
-          <span class="latency-label">${ms}ms</span>
-        </div>
-        <div class="original-text">${escapeHtml(original_text || "")}</div>
-        <div class="translated-text">${escapeHtml(translated_text)}</div>
-      `;
-      subtitlesBody.appendChild(card);
+      // Nếu là interim mà thẻ đã không còn tồn tại, bỏ qua không tạo thẻ mồ côi
+      if (type === "interim") return;
+      card = renderCard(cardId, displaySpeaker, fullOriginal || original_text, fullTranslated || translated_text, "final", ms);
     }
 
     scrollSubtitlesToBottom(false);
@@ -860,11 +1036,14 @@
 
     // Hẹn giờ làm mờ thẻ (chỉ áp dụng nếu autoFadeSeconds > 0)
     if (type === "final" && settings.autoFadeSeconds > 0) {
-      setTimeout(() => {
-        if (card && card.parentElement) {
-          card.style.opacity = "0.45";
-        }
-      }, settings.autoFadeSeconds * 1000);
+      const targetCard = shadowRoot.getElementById(cardId);
+      if (targetCard) {
+        setTimeout(() => {
+          if (targetCard && targetCard.parentElement) {
+            targetCard.style.opacity = "0.45";
+          }
+        }, settings.autoFadeSeconds * 1000);
+      }
     }
 
     console.log(
@@ -876,7 +1055,7 @@
 
   function trimOldCards() {
     if (!subtitlesBody) return;
-    const max = settings.maxCards || 80;
+    const max = settings.maxCards || 150;
     while (subtitlesBody.children.length > max) {
       const firstChild = subtitlesBody.firstElementChild;
       if (firstChild) {
@@ -885,6 +1064,54 @@
         break;
       }
     }
+  }
+
+  /**
+   * Thiết lập bộ lắng nghe sự kiện sao chép bản dịch (Event Delegation)
+   * Tự động phản hồi biểu tượng tích xanh ✓ trong 1.5 giây
+   */
+  function setupCopyButtonListener() {
+    if (!subtitlesBody) return;
+
+    subtitlesBody.addEventListener("click", async (e) => {
+      const copyBtn = e.target.closest(".card-copy-btn");
+      if (!copyBtn) return;
+      e.stopPropagation();
+
+      const card = copyBtn.closest(".subtitle-card");
+      if (!card) return;
+
+      const transEl = card.querySelector(".translated-text");
+      const textToCopy = transEl ? transEl.textContent.trim() : "";
+      if (!textToCopy || textToCopy === "..." || textToCopy.includes("Đang dịch...")) return;
+
+      try {
+        await navigator.clipboard.writeText(textToCopy);
+        copyBtn.classList.add("copied");
+        copyBtn.textContent = "✓";
+        copyBtn.title = "Đã sao chép!";
+        setTimeout(() => {
+          copyBtn.classList.remove("copied");
+          copyBtn.textContent = "📋";
+          copyBtn.title = "Sao chép bản dịch";
+        }, 1500);
+      } catch (err) {
+        const textarea = document.createElement("textarea");
+        textarea.value = textToCopy;
+        document.body.appendChild(textarea);
+        textarea.select();
+        try {
+          document.execCommand("copy");
+          copyBtn.classList.add("copied");
+          copyBtn.textContent = "✓";
+          setTimeout(() => {
+            copyBtn.classList.remove("copied");
+            copyBtn.textContent = "📋";
+          }, 1500);
+        } catch (e2) {}
+        document.body.removeChild(textarea);
+      }
+    });
   }
 
   function escapeHtml(text) {
@@ -959,6 +1186,12 @@
         <div class="header-left">
           <div class="status-dot ${isConnectedToServer ? "connected" : ""}" id="status-indicator" title="${isConnectedToServer ? "Đã kết nối Server" : "Chưa kết nối Server (Nhấp để kết nối lại)"}"></div>
           <span class="app-title">Phụ đề Nhật - Việt AI</span>
+          <div class="voice-wave" id="voice-wave" title="Đang nhận diện giọng nói">
+            <span class="bar"></span>
+            <span class="bar"></span>
+            <span class="bar"></span>
+            <span class="bar"></span>
+          </div>
           <span class="badge-tag">NLLB-200</span>
         </div>
         <div class="header-actions">
@@ -977,8 +1210,11 @@
           <div class="subtitle-meta">
             <span class="speaker-label" style="color: #81c995;">Hệ thống</span>
           </div>
-          <div class="translated-text" style="font-size: 13px; color: #a8dab5;">
-            Đã sẵn sàng. Hãy bật phụ đề tiếng Nhật (CC) trong Google Meet để bắt đầu dịch!
+          <div class="translated-row">
+            <div class="translated-text" style="font-size: 13px; color: #a8dab5;">
+              Đã sẵn sàng. Hãy bật phụ đề tiếng Nhật (CC) trong Google Meet để bắt đầu dịch!
+            </div>
+            <button class="card-copy-btn" title="Sao chép bản dịch" type="button">📋</button>
           </div>
         </div>
       </div>
@@ -989,8 +1225,11 @@
 
     subtitlesBody = shadowRoot.getElementById("subtitles-stream");
     statusDot = shadowRoot.getElementById("status-indicator");
+    voiceWaveEl = shadowRoot.getElementById("voice-wave");
     btnModeToggle = shadowRoot.getElementById("btn-mode-toggle");
     btnServerPower = shadowRoot.getElementById("btn-server-power");
+
+    setupCopyButtonListener();
 
     // Click vào status dot hoặc nút power để kết nối lại
     const triggerConnect = async () => {

@@ -149,7 +149,7 @@ async function broadcastToTabs(message) {
   }
 
   // Dự phòng nếu Port bị gián đoạn: Gửi trực tiếp qua chrome.tabs.sendMessage
-  if (chrome.tabs) {
+  if (!sentToPort && chrome.tabs) {
     try {
       const tabs = await chrome.tabs.query({ url: "https://meet.google.com/*" });
       for (const tab of tabs) {

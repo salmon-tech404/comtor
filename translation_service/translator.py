@@ -165,7 +165,7 @@ class TranslationEngine:
                 [source_tokens],
                 target_prefix=target_prefix,
                 beam_size=2,
-                max_decoding_length=128,
+                max_decoding_length=256,
                 repetition_penalty=1.2,
                 no_repeat_ngram_size=3
             )
