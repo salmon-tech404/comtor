@@ -249,6 +249,32 @@
   // 3. Phân Tích Cấu Trúc DOM Google Meet & Trích Xuất Dữ Liệu Khối
   // =========================================================================
 
+  // Ký tự tiếng Nhật (Hiragana, Katakana, Kanji)
+  const JA_REGEX = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/;
+
+  /**
+   * Tìm khối Speaker Block bao bọc một node phụ đề
+   */
+  function findSpeakerBlockFromNode(node) {
+    if (!node) return null;
+    let curr = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+    if (!curr) return null;
+
+    let bestBlock = curr;
+    // Leo lên tối đa 6 cấp để tìm khối thẻ người nói
+    for (let i = 0; i < 6 && curr && curr !== document.body; i++) {
+      if (curr.classList && (curr.classList.contains("nMDOkf") || curr.classList.contains("iTTPOb") || curr.hasAttribute("jsmodel"))) {
+        return curr;
+      }
+      if (curr.getAttribute("aria-live") || (curr.getAttribute("role") === "region" && /caption|phụ đề/i.test(curr.getAttribute("aria-label") || ""))) {
+        return bestBlock;
+      }
+      bestBlock = curr;
+      curr = curr.parentElement;
+    }
+    return bestBlock;
+  }
+
   function findCaptionContainer() {
     const specificSelectors = [
       'div[jscontroller="D1tHje"]',
@@ -256,16 +282,15 @@
       '[role="region"][aria-label*="caption" i]',
       '[role="region"][aria-label*="phụ đề" i]',
       '[role="region"][aria-label*="字幕" i]',
-      '[role="region"][aria-label*="subtitles" i]'
+      '[role="region"][aria-label*="subtitles" i]',
+      '[aria-live="polite"]',
+      '[aria-live="assertive"]'
     ];
 
     for (const sel of specificSelectors) {
       const el = document.querySelector(sel);
-      if (el) {
-        const rect = el.getBoundingClientRect();
-        if (rect.top > window.innerHeight * 0.25 && rect.height > 10) {
-          return el;
-        }
+      if (el && !el.closest("#gmeet-trans-host")) {
+        return el;
       }
     }
 
@@ -275,27 +300,31 @@
       if (parent) return parent;
     }
 
-    const liveElements = document.querySelectorAll('[aria-live="polite"], [aria-live="assertive"]');
-    for (const el of liveElements) {
-      if (el.closest('[role="status"], [role="alert"], .M9Bg4d, .eO2Zfd, [data-mdc-dialog-action]')) continue;
-      if (el.querySelector('button, [role="button"]')) continue;
-
+    // Dự phòng tìm phần tử đang hiển thị chữ Nhật ở nửa dưới màn hình
+    const allCandidates = document.querySelectorAll('span, div');
+    for (const el of allCandidates) {
+      if (el.closest("#gmeet-trans-host")) continue;
       const rect = el.getBoundingClientRect();
-      if (rect.top > window.innerHeight * 0.35 && rect.height > 15 && rect.width > 80) {
-        return el;
+      if (rect.top > window.innerHeight * 0.35 && rect.height > 10) {
+        if (JA_REGEX.test(el.textContent || "") && el.children.length === 0) {
+          return el.closest('.a4bvKc') || el.closest('[aria-live]') || el.parentElement?.parentElement || el.parentElement;
+        }
       }
     }
 
-    return null;
+    return document.querySelector('div[role="main"]') || document.body;
   }
 
   function getSpeakerBlockElement(targetNode, container) {
     if (!targetNode || !container || targetNode === container) return null;
 
     let curr = targetNode.nodeType === Node.ELEMENT_NODE ? targetNode : targetNode.parentElement;
-    if (!curr || !container.contains(curr)) return null;
+    if (!curr) return null;
+
+    if (curr.classList && curr.classList.contains("nMDOkf")) return curr;
 
     while (curr && curr.parentElement) {
+      if (curr.classList && curr.classList.contains("nMDOkf")) return curr;
       if (curr.parentElement === container) {
         return curr;
       }
@@ -304,13 +333,12 @@
       }
       curr = curr.parentElement;
     }
-    return null;
+    return findSpeakerBlockFromNode(targetNode);
   }
 
   /**
    * Trích xuất tên người nói và văn bản phụ đề CHÍNH XÁC từ blockElement
-   * LUÔN dùng clone toàn khối làm phương án duy nhất, loại bỏ avatar & phần tử tên,
-   * lấy phần text còn lại là câu nói tiếng Nhật.
+   * Tương thích cả meeting thông thường lẫn màn hình share presentation (Bản trình bày).
    */
   function extractBlockData(blockElement) {
     if (!blockElement) return { speaker: "Người tham gia", text: "" };
@@ -331,7 +359,15 @@
       }
     }
 
-    // 3. LUÔN dùng phương án clone toàn khối duy nhất, không dò đoán textContainer
+    // 3. Nhận diện trường hợp Bản trình bày / Share màn hình kèm tiếng
+    const rawBlockText = blockElement.textContent || "";
+    if (!speakerName) {
+      if (/Bản trình bày của bạn|Your presentation/i.test(rawBlockText)) {
+        speakerName = "Bản trình bày của bạn";
+      }
+    }
+
+    // 4. LUÔN dùng phương án clone toàn khối duy nhất, không dò đoán textContainer
     const clone = blockElement.cloneNode(true);
 
     // Xóa tất cả ảnh, avatar, SVG, icons, nút bấm
@@ -344,7 +380,10 @@
     text = text.replace(/^(mic_none|mic_off|arrow_downward|closed_caption|volume_up|more_vert|videocam|call_end)\s*/gi, "");
     text = text.replace(/[\r\n]+/g, " ").trim();
 
-    // Chỉ cắt tên nếu phần còn lại vẫn còn nội dung (tránh vô tình làm rỗng)
+    // Cắt bỏ nhãn Bản trình bày nếu còn dính trong chuỗi text
+    text = text.replace(/^(Bản trình bày của bạn|Your presentation|プレゼンテーション)\s*[:：\-]?\s*/gi, "");
+
+    // Chỉ cắt tên nếu phần còn lại vẫn còn nội dung câu nói
     if (speakerName && text.startsWith(speakerName) && text.length > speakerName.length) {
       text = text.substring(speakerName.length).trim();
     } else if (speakerName && text === speakerName) {
@@ -423,36 +462,23 @@
     }
 
     observedContainer = container;
-    console.log("[JA-VI Translator] Đã gắn MutationObserver vào Caption Container!");
+    console.log("[JA-VI Translator] Đã gắn MutationObserver vào Caption Container:", container);
 
     mainObserver = new MutationObserver((mutations) => {
       for (const mut of mutations) {
-        if (mut.type === "childList" && mut.removedNodes.length > 0) {
-          for (const node of mut.removedNodes) {
-            if (node.nodeType === Node.ELEMENT_NODE) {
-              if (activeBlocks.has(node)) {
-                removeBlock(node);
-              } else {
-                for (const [blockEl] of activeBlocks.entries()) {
-                  if (node.contains(blockEl)) {
-                    removeBlock(blockEl);
-                  }
-                }
-              }
-            }
-          }
-        }
+        let node = mut.target.nodeType === Node.ELEMENT_NODE ? mut.target : mut.target.parentElement;
+        if (!node || node.closest("#gmeet-trans-host")) continue;
 
-        const blockEl = getSpeakerBlockElement(mut.target, container);
-        if (blockEl) {
-          handleBlockMutation(blockEl);
-        } else if (mut.type === "childList" && mut.addedNodes.length > 0) {
-          for (const node of mut.addedNodes) {
-            if (node.nodeType === Node.ELEMENT_NODE) {
-              const candidate = getSpeakerBlockElement(node, container);
-              if (candidate) {
-                handleBlockMutation(candidate);
-              }
+        const textContent = node.textContent || "";
+        if (JA_REGEX.test(textContent)) {
+          const blockEl = getSpeakerBlockElement(node, container) || findSpeakerBlockFromNode(node);
+          if (blockEl) {
+            handleBlockMutation(blockEl);
+          }
+        } else if (mut.type === "childList" && mut.removedNodes.length > 0) {
+          for (const remNode of mut.removedNodes) {
+            if (remNode.nodeType === Node.ELEMENT_NODE && activeBlocks.has(remNode)) {
+              removeBlock(remNode);
             }
           }
         }
@@ -465,26 +491,41 @@
       characterData: true
     });
 
+    // Quét ban đầu nếu đã có sẵn câu tiếng Nhật trong container
     for (const child of container.children) {
-      handleBlockMutation(child);
+      if (JA_REGEX.test(child.textContent || "")) {
+        handleBlockMutation(child);
+      }
     }
   }
 
+  // Scanner định kỳ (mỗi 750ms) quét chủ động các thẻ tiếng Nhật trên màn hình Meet
   function startScanner() {
-    const timer = setInterval(() => {
-      if (!isExtensionValid()) {
-        clearInterval(timer);
-        if (mainObserver) {
-          mainObserver.disconnect();
-          mainObserver = null;
-        }
-        return;
-      }
+    setInterval(() => {
+      if (!isExtensionValid()) return;
+
       const container = findCaptionContainer();
       if (container && container !== observedContainer) {
         attachObserver(container);
       }
-    }, 1200);
+
+      // Quét chủ động: Tìm các phần tử chứa chữ Nhật ở nửa dưới màn hình
+      const candidates = document.querySelectorAll('span, div');
+      for (const el of candidates) {
+        if (el.closest("#gmeet-trans-host")) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.top > window.innerHeight * 0.35 && rect.height > 10) {
+          const txt = el.textContent || "";
+          if (JA_REGEX.test(txt) && el.children.length === 0) {
+            const blockEl = findSpeakerBlockFromNode(el);
+            if (blockEl) {
+              handleBlockMutation(blockEl);
+              break;
+            }
+          }
+        }
+      }
+    }, 750);
   }
 
   // =========================================================================
