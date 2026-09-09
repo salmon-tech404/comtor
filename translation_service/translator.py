@@ -4,8 +4,25 @@ Tự động kích hoạt GPU CUDA (RTX 4060) với compute_type='float16' hoặ
 """
 
 import os
+import re
 import time
 from typing import Tuple, List, Optional
+
+import site
+
+# Tự động nạp thư viện DLL của NVIDIA nếu cài qua pip
+try:
+    for site_pkg in site.getsitepackages():
+        for pkg_name in ["cublas", "cudnn", "cuda_nvrtc"]:
+            bin_dir = os.path.join(site_pkg, "nvidia", pkg_name, "bin")
+            if os.path.exists(bin_dir):
+                try:
+                    os.add_dll_directory(bin_dir)
+                    os.environ["PATH"] = bin_dir + os.pathsep + os.environ["PATH"]
+                except Exception:
+                    pass
+except Exception:
+    pass
 
 try:
     import ctranslate2
@@ -60,25 +77,46 @@ class TranslationEngine:
 
         start_time = time.time()
         try:
-            # 1. Nạp bộ suy luận CTranslate2
-            self.translator = ctranslate2.Translator(
-                self.model_dir,
-                device=self.device,
-                compute_type=self.compute_type,
-                inter_threads=2,
-                intra_threads=4
-            )
+            # 1. Thử nạp bộ suy luận CTranslate2 (ưu tiên CUDA nếu có)
+            try:
+                self.translator = ctranslate2.Translator(
+                    self.model_dir,
+                    device=self.device,
+                    compute_type=self.compute_type,
+                    inter_threads=2,
+                    intra_threads=4
+                )
+                if self.device == "cuda":
+                    # Kiểm tra warm-up xem DLL cublas có thực sự sẵn sàng không
+                    self.translator.translate_batch([["テスト"]], target_prefix=[["vie_Latn"]])
+            except Exception as cuda_err:
+                if self.device == "cuda":
+                    print(f"[Engine] CUDA runtime chưa đủ DLL ({cuda_err}). Tự động chuyển sang CPU (int8)...")
+                    self.device = "cpu"
+                    self.compute_type = "int8"
+                    self.translator = ctranslate2.Translator(
+                        self.model_dir,
+                        device="cpu",
+                        compute_type="int8",
+                        inter_threads=2,
+                        intra_threads=4
+                    )
+                else:
+                    raise cuda_err
 
             # 2. Nạp Tokenizer NLLB-200 (Hỗ trợ SentencePiece của NLLB)
-            # Thử nạp từ model_dir nếu có tokenizer files kèm theo, nếu không nạp từ Hugging Face
             try:
                 self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir, src_lang="jpn_Jpan")
             except Exception:
-                print(f"[Engine] Nạp tokenizer từ HuggingFace '{self.tokenizer_name}'...")
+                print(f"[Engine] Nạp tokenizer từ '{self.tokenizer_name}'...")
                 self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name, src_lang="jpn_Jpan")
+                try:
+                    self.tokenizer.save_pretrained(self.model_dir)
+                except Exception:
+                    pass
 
             load_time = time.time() - start_time
-            print(f"[Engine] Nạp mô hình thành công trong {load_time:.2f}s! Sẵn sàng dịch tức thì.")
+            print(f"[Engine] Nạp mô hình thành công trên {self.device.upper()} ({self.compute_type}) trong {load_time:.2f}s! Sẵn sàng dịch tức thì.")
             self.is_loaded = True
             return True
         except Exception as e:
@@ -101,23 +139,35 @@ class TranslationEngine:
             # Chế độ dự phòng khi chưa tải xong model để test pipeline
             return f"[Chưa tải model] {text}", 1.0
 
+        cleaned_text = text.strip()
+        cleaned_text = re.sub(r'^(mic_none|mic_off|arrow_downward|closed_caption|volume_up|more_vert|videocam|call_end)\s*', '', cleaned_text, flags=re.IGNORECASE).strip()
+        if not cleaned_text:
+            return "", 0.0
+
+        # Nếu văn bản đã là Tiếng Việt và không chứa ký tự tiếng Nhật, không cần dịch
+        has_vn = bool(re.search(r'[àáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđ]', cleaned_text, re.IGNORECASE))
+        has_ja = bool(re.search(r'[\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff]', cleaned_text))
+        if has_vn and not has_ja:
+            return cleaned_text, 0.1
+
         t0 = time.perf_counter()
 
         try:
             self.tokenizer.src_lang = src_lang
             # 1. Tokenize văn bản nguồn
-            source_tokens = self.tokenizer.convert_ids_to_tokens(self.tokenizer.encode(text.strip()))
+            source_tokens = self.tokenizer.convert_ids_to_tokens(self.tokenizer.encode(cleaned_text))
 
             # 2. Định dạng target_prefix cho NLLB
             target_prefix = [[tgt_lang]]
 
-            # 3. Suy luận song song qua CTranslate2
+            # 3. Suy luận song song qua CTranslate2 (Beam=2, Repetition Penalty chống lặp từ)
             results = self.translator.translate_batch(
                 [source_tokens],
                 target_prefix=target_prefix,
-                beam_size=1, # Beam size 1 cực nhanh cho real-time
+                beam_size=2,
                 max_decoding_length=128,
-                sampling_temperature=1.0
+                repetition_penalty=1.2,
+                no_repeat_ngram_size=3
             )
 
             # 4. Trích xuất token kết quả

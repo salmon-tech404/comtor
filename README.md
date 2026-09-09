@@ -20,6 +20,7 @@ Hệ thống dịch song song phụ đề Google Meet (Closed Captions) từ ti�
    - Được đóng gói hoàn toàn trong **Shadow DOM**, ngăn ngừa triệt để việc xung đột CSS với Google Meet.
    - Nền tối Glassmorphism tương phản cao, dễ đọc trên mọi phông nền video.
    - Hỗ trợ kéo thả (Drag & Drop) tự do và tự động ghi nhớ vị trí trên màn hình qua `chrome.storage.local`.
+   - Hỗ trợ 2 chế độ hiển thị linh hoạt: **Chỉ Tiếng Việt (Only)** (gọn gàng, tiết kiệm không gian) hoặc **Song ngữ (Cả 2: Nhật + Việt)**, chuyển đổi tức thì chỉ bằng 1 cú nhấp chuột ngay trên thanh tiêu đề bảng phụ đề hoặc qua Popup tiện ích.
    - Chế độ dịch câu nháp tức thì (**Interim Live Draft**) chữ nghiêng vàng giúp nắm bắt ý đồ người nói ngay khi chưa nói xong câu.
    - Tự động làm mờ và ẩn các dòng phụ đề cũ sau 25 giây.
 

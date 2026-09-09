@@ -234,3 +234,65 @@
 .font-small .translated-text { font-size: 13px; }
 .font-medium .translated-text { font-size: 15px; }
 .font-large .translated-text { font-size: 18px; }
+
+/* Chế độ chỉ hiển thị Tiếng Việt (ẩn câu tiếng Nhật gốc) */
+#trans-overlay-container.mode-vi-only .original-text {
+  display: none !important;
+}
+
+/* Nút chuyển đổi chế độ phụ đề (Song ngữ / Chỉ Tiếng Việt) */
+.mode-toggle-btn {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  color: #e8eaed;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  white-space: nowrap;
+}
+
+.mode-toggle-btn:hover {
+  background: rgba(26, 115, 232, 0.3);
+  border-color: #8ab4f8;
+  color: #ffffff;
+}
+
+.mode-toggle-btn.vi-only {
+  background: rgba(52, 168, 83, 0.25);
+  border-color: rgba(52, 168, 83, 0.5);
+  color: #81c995;
+}
+
+/* Nút bật/tắt kết nối máy chủ trên Overlay header */
+.server-power-btn {
+  background: rgba(234, 67, 53, 0.15);
+  border: 1px solid rgba(234, 67, 53, 0.35);
+  color: #f28b82;
+  padding: 2px 7px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  white-space: nowrap;
+}
+
+.server-power-btn:hover {
+  background: rgba(234, 67, 53, 0.3);
+  color: #ffffff;
+}
+
+.server-power-btn.connected {
+  background: rgba(52, 168, 83, 0.15);
+  border-color: rgba(52, 168, 83, 0.4);
+  color: #81c995;
+}
+
+.server-power-btn.connected:hover {
+  background: rgba(234, 67, 53, 0.25);
+  border-color: rgba(234, 67, 53, 0.5);
+  color: #f28b82;
+}

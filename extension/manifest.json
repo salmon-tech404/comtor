@@ -4,10 +4,12 @@
   "version": "1.0.0",
   "description": "Dịch phụ đề tiếng Nhật trên Google Meet sang tiếng Việt thời gian thực với AI CTranslate2 độ trễ cực thấp.",
   "permissions": [
-    "storage"
+    "storage",
+    "alarms"
   ],
   "host_permissions": [
-    "https://meet.google.com/*"
+    "https://meet.google.com/*",
+    "http://127.0.0.1:8765/*"
   ],
   "background": {
     "service_worker": "background.js"

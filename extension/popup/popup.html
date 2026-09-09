@@ -25,9 +25,12 @@
         <input type="checkbox" id="toggleEnable" checked>
       </div>
 
-      <div class="form-group toggle-group">
-        <label for="toggleOriginal">Hiện câu tiếng Nhật gốc</label>
-        <input type="checkbox" id="toggleOriginal" checked>
+      <div class="form-group">
+        <label for="modeSelect">Chế độ hiển thị phụ đề</label>
+        <select id="modeSelect">
+          <option value="both" selected>🌐 Song ngữ (Cả 2: Nhật + Việt)</option>
+          <option value="vi_only">🇻🇳 Chỉ Tiếng Việt (Only)</option>
+        </select>
       </div>
 
       <div class="form-group toggle-group">
@@ -44,7 +47,16 @@
         </select>
       </div>
 
-      <button id="btnReconnect" class="btn-primary">Kết nối lại Server</button>
+      <div class="server-control-box">
+        <div class="server-status-info">
+          <span class="server-label">Trạng thái Server:</span>
+          <span class="server-badge" id="serverBadge">Đang kiểm tra...</span>
+        </div>
+        <button id="btnToggleConnect" class="btn-primary btn-connect">
+          <span id="btnConnectIcon">⚡</span>
+          <span id="btnConnectText">Kết nối Server</span>
+        </button>
+      </div>
     </div>
 
     <div class="footer">

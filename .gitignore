@@ -1,0 +1,83 @@
+# =========================================================================
+# Python & Bytecode
+# =========================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# =========================================================================
+# Virtual Environments
+# =========================================================================
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# =========================================================================
+# Large AI Models & Weights (NLLB-200, CTranslate2, PyTorch)
+# Do NOT commit heavy model checkpoints to Git (> 100MB)
+# =========================================================================
+translation_service/models/
+models/
+*.bin
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.model
+*.spm
+
+# =========================================================================
+# Runtime Cache & Logs
+# =========================================================================
+translation_service/cache/
+cache/
+*.log
+logs/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# =========================================================================
+# Environment Variables & Secrets
+# =========================================================================
+.env
+.env.*
+!.env.example
+
+# =========================================================================
+# Operating System & IDE Files
+# =========================================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
