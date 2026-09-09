@@ -1,0 +1,129 @@
+body {
+  margin: 0;
+  padding: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: #1e2124;
+  color: #e8eaed;
+  width: 280px;
+}
+
+.popup-container {
+  display: flex;
+  flex-direction: column;
+}
+
+.header {
+  padding: 12px 14px;
+  background: #14171a;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.logo {
+  font-size: 16px;
+}
+
+.title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #ffffff;
+}
+
+.status-indicator {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: #ea4335;
+}
+
+.status-dot.connected {
+  background-color: #34a853;
+  box-shadow: 0 0 6px rgba(52, 168, 83, 0.8);
+}
+
+.status-text {
+  font-size: 11px;
+  color: #9aa0a6;
+}
+
+.body {
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.form-group label {
+  color: #bdc1c6;
+  cursor: pointer;
+}
+
+.toggle-group {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.toggle-group input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: #1a73e8;
+  cursor: pointer;
+}
+
+select {
+  padding: 6px 8px;
+  background: #2b2f35;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: #ffffff;
+  border-radius: 6px;
+  font-size: 12px;
+  outline: none;
+}
+
+.btn-primary {
+  margin-top: 4px;
+  padding: 8px;
+  background: #1a73e8;
+  color: #ffffff;
+  border: none;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+
+.btn-primary:hover {
+  background: #1765cc;
+}
+
+.footer {
+  padding: 8px 14px;
+  background: #14171a;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: 10px;
+  color: #80868b;
+  text-align: center;
+}

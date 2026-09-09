@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Google Meet Translator</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="popup-container">
+    <div class="header">
+      <div class="brand">
+        <span class="logo">⚡</span>
+        <span class="title">JA-VI Translator</span>
+      </div>
+      <div class="status-indicator">
+        <span class="status-dot" id="statusDot"></span>
+        <span class="status-text" id="statusText">Đang kiểm tra...</span>
+      </div>
+    </div>
+
+    <div class="body">
+      <div class="form-group toggle-group">
+        <label for="toggleEnable">Bật dịch thời gian thực</label>
+        <input type="checkbox" id="toggleEnable" checked>
+      </div>
+
+      <div class="form-group toggle-group">
+        <label for="toggleOriginal">Hiện câu tiếng Nhật gốc</label>
+        <input type="checkbox" id="toggleOriginal" checked>
+      </div>
+
+      <div class="form-group toggle-group">
+        <label for="toggleInterim">Bật dịch câu tạm thời (Live)</label>
+        <input type="checkbox" id="toggleInterim" checked>
+      </div>
+
+      <div class="form-group">
+        <label for="fontSizeSelect">Cỡ chữ phụ đề</label>
+        <select id="fontSizeSelect">
+          <option value="small">Nhỏ (13px)</option>
+          <option value="medium" selected>Vừa (15px)</option>
+          <option value="large">Lớn (18px)</option>
+        </select>
+      </div>
+
+      <button id="btnReconnect" class="btn-primary">Kết nối lại Server</button>
+    </div>
+
+    <div class="footer">
+      <span>Mô hình: NLLB-200 | CTranslate2 GPU</span>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
