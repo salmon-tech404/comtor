@@ -13,7 +13,7 @@
   if (window.__GMEET_JA_VI_INJECTED__) return;
   window.__GMEET_JA_VI_INJECTED__ = true;
 
-  console.log("%c[JA-VI Translator]%c Khởi động với Kiến trúc Block-Level & Resizable UI...", "color: #1a73e8; font-weight: bold;", "color: inherit;");
+  console.log("%c[JA-VI]%c Extension đã sẵn sàng.", "color: #1a73e8; font-weight: bold;", "color: inherit;");
 
   // Cấu hình phiên làm việc
   const sessionId = "meet_" + Math.random().toString(36).substring(2, 9) + "_" + Date.now();
@@ -58,8 +58,16 @@
 
       bgPort.onMessage.addListener((msg) => {
         if (msg.type === "CONNECTION_STATUS") {
+          const prev = isConnectedToServer;
           isConnectedToServer = Boolean(msg.connected);
           updateUiConnectionStatus(msg.connected);
+          if (prev !== isConnectedToServer) {
+            console.log(
+              `%c[JA-VI]%c Trạng thái máy chủ dịch: ${isConnectedToServer ? "🟢 Đã kết nối (ws://127.0.0.1:8765)" : "🔴 Mất kết nối (đang thử lại...)"}`,
+              isConnectedToServer ? "color: #34a853; font-weight: bold;" : "color: #ea4335; font-weight: bold;",
+              "color: inherit;"
+            );
+          }
         } else if (msg.type === "TRANSLATION_RESULT") {
           handleTranslationResult(msg.payload);
         }
@@ -171,8 +179,8 @@
     }
 
     console.log(
-      `%c[JA-VI][${type.toUpperCase()} SENT]%c [${blockState.blockId}][Req #${currentReqId}][Seq #${seqToSend}] [${blockState.speaker}]: "${currentText.substring(0, 35)}..."`,
-      type === "final" ? "color: #34a853; font-weight: bold;" : "color: #fbbc04;",
+      `%c[JA-VI][Gửi dịch ${type.toUpperCase()}]%c [${blockState.speaker}]: "${currentText}"`,
+      type === "final" ? "color: #1a73e8; font-weight: bold;" : "color: #fbbc04;",
       "color: inherit;"
     );
   }
@@ -209,7 +217,6 @@
     activeBlocks.set(element, state);
     blocksById.set(blockId, state);
 
-    console.log(`%c[JA-VI][BLOCK CREATED]%c ID: ${blockId} | Speaker: "${state.speaker}"`, "color: #1a73e8; font-weight: bold;", "color: inherit;");
     return state;
   }
 
@@ -234,8 +241,6 @@
   function removeBlock(element) {
     const blockState = activeBlocks.get(element);
     if (!blockState) return;
-
-    console.log(`%c[JA-VI][BLOCK REMOVED]%c ID: ${blockState.blockId} | Speaker: "${blockState.speaker}"`, "color: #ea4335; font-weight: bold;", "color: inherit;");
 
     finalizeBlock(blockState);
     activeBlocks.delete(element);
@@ -262,14 +267,15 @@
     const allLeafs = Array.from(
       document.querySelectorAll('body *:not(script):not(style):not(dialog):not([role="dialog"]):not([role="menu"])')
     ).filter((el) => {
-      if (el.children.length !== 0 || el.offsetHeight <= 0) return false;
       if (el.closest("#gmeet-trans-host")) return false;
       if (el.closest('button, [role="button"], [role="toolbar"], [role="menu"], [role="tooltip"], [tooltip-id]')) return false;
       const text = (el.textContent || "").trim();
       if (!JA_REGEX.test(text)) return false;
+      // Chọn phần tử sâu nhất chứa chữ Nhật (không có phần tử con nào khác chứa chữ Nhật)
+      const hasJaChild = Array.from(el.children).some(child => JA_REGEX.test(child.textContent || ""));
+      if (hasJaChild) return false;
       const rect = el.getBoundingClientRect();
-      // Phụ đề Meet luôn hiển thị ở nửa dưới hoặc giữa màn hình (top > 25% chiều cao màn hình)
-      return rect.top > window.innerHeight * 0.25 && rect.height > 5;
+      return rect.height > 4 && rect.width > 4;
     });
 
     if (allLeafs.length > 0) {
@@ -483,8 +489,6 @@
   function handleBlockMutation(blockElement) {
     const { speaker, text } = extractBlockData(blockElement);
 
-    console.log("%c[JA-VI][DEBUG]%c handleBlockMutation gọi với element:", "color: #ff9800; font-weight: bold;", "color: inherit;", blockElement, "| speaker:", speaker, "| text:", JSON.stringify(text));
-
     // Nếu text trống: chốt câu cũ nếu đang có
     if (!text || !text.trim() || text.length === 0) {
       const existingState = activeBlocks.get(blockElement);
@@ -554,6 +558,13 @@
 
     if (text === blockState.lastObservedText) return;
 
+    // Log luồng chính: Bắt được phụ đề tiếng Nhật mới
+    console.log(
+      `%c[JA-VI][Nhận phụ đề]%c [${blockState.speaker}]: "${text}"`,
+      "color: #ea8600; font-weight: bold;",
+      "color: inherit;"
+    );
+
     blockState.lastObservedText = text;
     blockState.lastUpdatedAt = Date.now();
 
@@ -592,10 +603,6 @@
     const blocks = getBlockList(container);
     const liveEls = new Set(blocks);
 
-    if (blocks.length > 0) {
-      console.log(`%c[JA-VI][DEBUG]%c scanAllBlocks tìm thấy ${blocks.length} block con:`, "color: #00bcd4;", "color: inherit;", blocks);
-    }
-
     for (const child of blocks) {
       handleBlockMutation(child);
     }
@@ -619,7 +626,7 @@
     }
 
     observedContainer = container;
-    console.log("%c[JA-VI Translator]%c Gắn MutationObserver vào Caption Container:", "color: #1a73e8; font-weight: bold;", "color: inherit;", container);
+    console.log("%c[JA-VI]%c Đã phát hiện và gắn theo dõi phụ đề Google Meet.", "color: #34a853; font-weight: bold;", "color: inherit;");
 
     mainObserver = new MutationObserver(() => {
       scanAllBlocks(container);
@@ -635,27 +642,60 @@
     scanAllBlocks(container);
   }
 
-  // Scanner định kỳ (mỗi 600ms) quét chủ động theo container thực tế
-  let lastScannerLogTime = 0;
-  function startScanner() {
+  // Theo dõi DOM theo sự kiện (Event-Driven) - Thay thế hoàn toàn vòng lặp polling mỗi giây
+  let rootObserver = null;
+  let domCheckTimeout = null;
+
+  function initCaptionWatcher() {
+    // 1. Kiểm tra ngay nếu container phụ đề đã có sẵn trên trang
+    const initialContainer = findCaptionContainer();
+    if (initialContainer) {
+      attachObserver(initialContainer);
+    }
+
+    // 2. Theo dõi biến đổi DOM của trang (MutationObserver)
+    // Chỉ kích hoạt khi Google Meet thực sự thêm/sửa DOM, không chạy vô ích mỗi giây
+    rootObserver = new MutationObserver(() => {
+      if (domCheckTimeout) return;
+      domCheckTimeout = setTimeout(() => {
+        domCheckTimeout = null;
+        if (!isExtensionValid()) return;
+
+        // Nếu container hiện tại bị gỡ khỏi DOM (ví dụ user tắt CC)
+        if (observedContainer && !document.body.contains(observedContainer)) {
+          if (mainObserver) {
+            mainObserver.disconnect();
+            mainObserver = null;
+          }
+          observedContainer = null;
+        }
+
+        // Nếu chưa có container đang theo dõi, thử tìm container
+        if (!observedContainer) {
+          const container = findCaptionContainer();
+          if (container) {
+            attachObserver(container);
+          }
+        }
+      }, 250);
+    });
+
+    rootObserver.observe(document.body, {
+      childList: true,
+      subtree: true
+    });
+
+    // 3. Watchdog dự phòng chạy chậm (4 giây / lần) hoàn toàn im lặng, không ghi log
+    // Chỉ chạy kiểm tra khi chưa tìm thấy container
     setInterval(() => {
       if (!isExtensionValid()) return;
-
-      const container = findCaptionContainer();
-      const now = Date.now();
-      if (now - lastScannerLogTime > 2500) {
-        lastScannerLogTime = now;
-        console.log("[JA-VI][DEBUG] Scanner tick, container hiện tại:", container, "| observedContainer:", observedContainer);
-      }
-
-      if (container) {
-        if (container !== observedContainer) {
+      if (!observedContainer || !document.body.contains(observedContainer)) {
+        const container = findCaptionContainer();
+        if (container && container !== observedContainer) {
           attachObserver(container);
-        } else {
-          scanAllBlocks(container);
         }
       }
-    }, 600);
+    }, 4000);
   }
 
   // =========================================================================
@@ -828,8 +868,8 @@
     }
 
     console.log(
-      `%c[JA-VI][RESP RECEIVED]%c [${block_id}][${type.toUpperCase()}] "${translated_text.substring(0, 30)}..." [${ms}ms]`,
-      "color: #1a73e8;",
+      `%c[JA-VI][Đã dịch ${type.toUpperCase()}]%c [${displaySpeaker}]: "${translated_text}" (${ms}ms)`,
+      type === "final" ? "color: #34a853; font-weight: bold;" : "color: #81c995;",
       "color: inherit;"
     );
   }
@@ -1150,12 +1190,12 @@
   // Khởi động toàn bộ
   setupBackgroundPort();
   createOverlayUi();
-  startScanner();
+  initCaptionWatcher();
 
-  // Định kỳ kiểm tra trạng thái kết nối máy chủ mỗi 3s
+  // Định kỳ kiểm tra trạng thái kết nối máy chủ mỗi 5s (hoàn toàn im lặng)
   setInterval(() => {
     syncServerStatus();
-  }, 3000);
+  }, 5000);
 
   // Đồng bộ trạng thái ban đầu ngay sau khi nạp UI
   setTimeout(() => {
