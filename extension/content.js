@@ -215,6 +215,7 @@
 
   function finalizeBlock(blockState) {
     if (blockState.isFinalized) return;
+    blockState.isFinalized = true;
 
     if (blockState.debounceTimer) {
       clearTimeout(blockState.debounceTimer);
@@ -237,54 +238,33 @@
     console.log(`%c[JA-VI][BLOCK REMOVED]%c ID: ${blockState.blockId} | Speaker: "${blockState.speaker}"`, "color: #ea4335; font-weight: bold;", "color: inherit;");
 
     finalizeBlock(blockState);
-    blockState.isFinalized = true;
     activeBlocks.delete(element);
 
     setTimeout(() => {
       blocksById.delete(blockState.blockId);
-    }, 15000);
+    }, 25000);
   }
 
   // =========================================================================
-  // 3. Phân Tích Cấu Trúc DOM Google Meet & Trích Xuất Dữ Liệu Khối
+  // 3. Phân Tích Cấu Trúc DOM Google Meet & Quét Khối Thống Nhất (Unified Scanner)
   // =========================================================================
 
   // Ký tự tiếng Nhật (Hiragana, Katakana, Kanji)
   const JA_REGEX = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]/;
 
   /**
-   * Tìm khối Speaker Block bao bọc một node phụ đề
+   * Tìm vùng chứa phụ đề chính xác của Google Meet
+   * Hỗ trợ cuộc họp thông thường, trình bày màn hình (Presentation), và PiP
    */
-  function findSpeakerBlockFromNode(node) {
-    if (!node) return null;
-    let curr = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
-    if (!curr) return null;
-
-    let bestBlock = curr;
-    // Leo lên tối đa 6 cấp để tìm khối thẻ người nói
-    for (let i = 0; i < 6 && curr && curr !== document.body; i++) {
-      if (curr.classList && (curr.classList.contains("nMDOkf") || curr.classList.contains("iTTPOb") || curr.hasAttribute("jsmodel"))) {
-        return curr;
-      }
-      if (curr.getAttribute("aria-live") || (curr.getAttribute("role") === "region" && /caption|phụ đề/i.test(curr.getAttribute("aria-label") || ""))) {
-        return bestBlock;
-      }
-      bestBlock = curr;
-      curr = curr.parentElement;
-    }
-    return bestBlock;
-  }
-
   function findCaptionContainer() {
+    // 1. Các bộ chọn chuẩn đặc trưng nhất của Google Meet
     const specificSelectors = [
-      'div[jscontroller="D1tHje"]',
       '.a4bvKc',
+      'div[jscontroller="D1tHje"]',
       '[role="region"][aria-label*="caption" i]',
       '[role="region"][aria-label*="phụ đề" i]',
       '[role="region"][aria-label*="字幕" i]',
-      '[role="region"][aria-label*="subtitles" i]',
-      '[aria-live="polite"]',
-      '[aria-live="assertive"]'
+      '[role="region"][aria-label*="subtitles" i]'
     ];
 
     for (const sel of specificSelectors) {
@@ -294,46 +274,78 @@
       }
     }
 
+    // 2. Tìm thông qua hàng speaker đặc trưng của Google Meet (.nMDOkf, [jsname="YSxPC"])
     const rowEl = document.querySelector('.nMDOkf, [jsname="YSxPC"]');
-    if (rowEl) {
+    if (rowEl && !rowEl.closest("#gmeet-trans-host")) {
       const parent = rowEl.closest('.a4bvKc') || rowEl.closest('div[jscontroller="D1tHje"]') || rowEl.parentElement;
       if (parent) return parent;
     }
 
-    // Dự phòng tìm phần tử đang hiển thị chữ Nhật ở nửa dưới màn hình
-    const allCandidates = document.querySelectorAll('span, div');
-    for (const el of allCandidates) {
-      if (el.closest("#gmeet-trans-host")) continue;
-      const rect = el.getBoundingClientRect();
-      if (rect.top > window.innerHeight * 0.35 && rect.height > 10) {
-        if (JA_REGEX.test(el.textContent || "") && el.children.length === 0) {
-          return el.closest('.a4bvKc') || el.closest('[aria-live]') || el.parentElement?.parentElement || el.parentElement;
+    // 3. Quét tìm container thực tế chứa chữ tiếng Nhật ở nửa dưới màn hình
+    const allDivs = document.querySelectorAll('div');
+    for (const div of allDivs) {
+      if (div.closest("#gmeet-trans-host")) continue;
+      const rect = div.getBoundingClientRect();
+      if (rect.top > window.innerHeight * 0.4 && rect.height > 15 && rect.height < 500 && rect.width > 150) {
+        const txt = div.textContent || "";
+        if (JA_REGEX.test(txt)) {
+          if (div.classList.contains("a4bvKc") || div.hasAttribute("jscontroller")) {
+            return div;
+          }
+          const region = div.closest('[role="region"]');
+          if (region && !region.closest("#gmeet-trans-host")) {
+            return region;
+          }
         }
       }
     }
 
-    return document.querySelector('div[role="main"]') || document.body;
+    // 4. Tìm phần tử chứa tiếng Nhật sâu nhất và lấy container cha phù hợp
+    const jaElements = Array.from(document.querySelectorAll('span, p, div')).filter(el => {
+      if (el.closest("#gmeet-trans-host")) return false;
+      const rect = el.getBoundingClientRect();
+      return rect.top > window.innerHeight * 0.4 && rect.height > 10 && JA_REGEX.test(el.textContent || "");
+    });
+
+    if (jaElements.length > 0) {
+      const deepest = jaElements[jaElements.length - 1];
+      let candidate = deepest;
+      for (let i = 0; i < 4 && candidate && candidate.parentElement && candidate.parentElement !== document.body; i++) {
+        candidate = candidate.parentElement;
+        if (candidate.classList.contains("a4bvKc") || candidate.getAttribute("role") === "region" || candidate.children.length > 1) {
+          return candidate;
+        }
+      }
+      if (candidate && candidate !== document.body) return candidate;
+    }
+
+    return null;
   }
 
-  function getSpeakerBlockElement(targetNode, container) {
-    if (!targetNode || !container || targetNode === container) return null;
+  /**
+   * Lấy danh sách các Speaker Block con trực tiếp từ Caption Container (Kiến trúc chuẩn Bug B)
+   */
+  function getBlockList(container) {
+    if (!container) return [];
 
-    let curr = targetNode.nodeType === Node.ELEMENT_NODE ? targetNode : targetNode.parentElement;
-    if (!curr) return null;
+    let list = Array.from(container.children).filter(
+      c => !(c.closest && c.closest('#gmeet-trans-host')) && c.offsetHeight > 0
+    );
 
-    if (curr.classList && curr.classList.contains("nMDOkf")) return curr;
-
-    while (curr && curr.parentElement) {
-      if (curr.classList && curr.classList.contains("nMDOkf")) return curr;
-      if (curr.parentElement === container) {
-        return curr;
-      }
-      if (curr.parentElement.parentElement === container && curr.parentElement.children.length > 1) {
-        return curr;
-      }
-      curr = curr.parentElement;
+    // Nếu container có 1 wrapper trung gian bọc ngoài
+    if (list.length === 1 && list[0].children && list[0].children.length > 1) {
+      const innerList = Array.from(list[0].children).filter(
+        c => !(c.closest && c.closest('#gmeet-trans-host')) && c.offsetHeight > 0
+      );
+      if (innerList.length > 0) return innerList;
     }
-    return findSpeakerBlockFromNode(targetNode);
+
+    // Nếu bản thân container là 1 speaker block duy nhất (ví dụ chỉ có 1 người trình bày)
+    if (list.length === 0 && container.offsetHeight > 0 && JA_REGEX.test(container.textContent || "")) {
+      return [container];
+    }
+
+    return list;
   }
 
   /**
@@ -362,12 +374,12 @@
     // 3. Nhận diện trường hợp Bản trình bày / Share màn hình kèm tiếng
     const rawBlockText = blockElement.textContent || "";
     if (!speakerName) {
-      if (/Bản trình bày của bạn|Your presentation/i.test(rawBlockText)) {
+      if (/Bản trình bày của bạn|Your presentation|プレゼンテーション/i.test(rawBlockText)) {
         speakerName = "Bản trình bày của bạn";
       }
     }
 
-    // 4. LUÔN dùng phương án clone toàn khối duy nhất, không dò đoán textContainer
+    // 4. Dùng bản sao clone để bóc tách text phụ đề, không làm biến đổi DOM thật
     const clone = blockElement.cloneNode(true);
 
     // Xóa tất cả ảnh, avatar, SVG, icons, nút bấm
@@ -397,16 +409,22 @@
   }
 
   /**
-   * Xử lý khi có thay đổi trong một Speaker Block
+   * Xử lý thay đổi dữ liệu trong một Speaker Block (Đã khắc phục hoàn toàn Bug A & Lưu lịch sử cuộn)
    */
   function handleBlockMutation(blockElement) {
     const { speaker, text } = extractBlockData(blockElement);
 
+    // Nếu text trống: chốt câu cũ nếu đang có
     if (!text || !text.trim() || text.length === 0) {
       const existingState = activeBlocks.get(blockElement);
-      if (existingState && existingState.lastObservedText) {
+      if (existingState && existingState.lastObservedText && !existingState.isFinalized) {
         finalizeBlock(existingState);
       }
+      return;
+    }
+
+    // Chỉ xử lý nếu text có chứa ký tự tiếng Nhật
+    if (!JA_REGEX.test(text)) {
       return;
     }
 
@@ -414,9 +432,53 @@
 
     if (!blockState) {
       blockState = createBlockState(blockElement, speaker);
-    } else if (speaker && speaker !== "Người tham gia" && blockState.speaker === "Người tham gia") {
-      blockState.speaker = speaker;
-      updateCardSpeaker(blockState);
+    } else if (blockState.isFinalized) {
+      // FIX LỖI A: Mở khóa cờ isFinalized và tạo Card mới để lưu lại thẻ câu cũ trong lịch sử cuộn
+      blockCounter++;
+      const newBlockId = `blk_${blockCounter}_${Date.now().toString(36)}`;
+      blockState.blockId = newBlockId;
+      blockState.cardId = `sub-card-${newBlockId}`;
+      blockState.cardElement = null;
+      blockState.isFinalized = false;
+      blockState.blockSeq = 0;
+      blockState.activeRequestId = 0;
+      blockState.committedText = "";
+      blockState.lastObservedText = "";
+      blockState.lastSentInterimText = "";
+      if (speaker && speaker !== "Người tham gia") {
+        blockState.speaker = speaker;
+      }
+      blocksById.set(newBlockId, blockState);
+    } else {
+      // Kiểm tra xem Meet có thay thế trực tiếp phụ đề mới mà không clear DOM không
+      const prevText = blockState.lastObservedText;
+      const isCompletelyNewText = prevText &&
+        blockState.committedText &&
+        prevText.length >= 6 &&
+        !text.includes(prevText.substring(0, Math.min(6, prevText.length))) &&
+        !prevText.includes(text.substring(0, Math.min(6, text.length)));
+
+      if (isCompletelyNewText) {
+        finalizeBlock(blockState);
+        blockCounter++;
+        const newBlockId = `blk_${blockCounter}_${Date.now().toString(36)}`;
+        blockState.blockId = newBlockId;
+        blockState.cardId = `sub-card-${newBlockId}`;
+        blockState.cardElement = null;
+        blockState.isFinalized = false;
+        blockState.blockSeq = 0;
+        blockState.activeRequestId = 0;
+        blockState.committedText = "";
+        blockState.lastObservedText = "";
+        blockState.lastSentInterimText = "";
+        if (speaker && speaker !== "Người tham gia") {
+          blockState.speaker = speaker;
+        }
+        blocksById.set(newBlockId, blockState);
+      } else if (speaker && speaker !== "Người tham gia" && blockState.speaker === "Người tham gia") {
+        blockState.speaker = speaker;
+        updateCardSpeaker(blockState);
+      }
     }
 
     if (text === blockState.lastObservedText) return;
@@ -451,38 +513,41 @@
     }, 450);
   }
 
+  /**
+   * Quét và xử lý tất cả speaker blocks trong container (Kiến trúc đồng bộ duy nhất)
+   */
+  function scanAllBlocks(container) {
+    if (!container) return;
+    const blocks = getBlockList(container);
+    const liveEls = new Set(blocks);
+
+    for (const child of blocks) {
+      handleBlockMutation(child);
+    }
+
+    for (const [el, state] of activeBlocks.entries()) {
+      if (!liveEls.has(el) && !document.body.contains(el)) {
+        removeBlock(el);
+      }
+    }
+  }
+
   // Observer theo dõi toàn bộ vùng phụ đề
   let mainObserver = null;
   let observedContainer = null;
 
   function attachObserver(container) {
+    if (!container) return;
     if (mainObserver) {
       mainObserver.disconnect();
       mainObserver = null;
     }
 
     observedContainer = container;
-    console.log("[JA-VI Translator] Đã gắn MutationObserver vào Caption Container:", container);
+    console.log("%c[JA-VI Translator]%c Gắn MutationObserver vào Caption Container:", "color: #1a73e8; font-weight: bold;", "color: inherit;", container);
 
-    mainObserver = new MutationObserver((mutations) => {
-      for (const mut of mutations) {
-        let node = mut.target.nodeType === Node.ELEMENT_NODE ? mut.target : mut.target.parentElement;
-        if (!node || node.closest("#gmeet-trans-host")) continue;
-
-        const textContent = node.textContent || "";
-        if (JA_REGEX.test(textContent)) {
-          const blockEl = getSpeakerBlockElement(node, container) || findSpeakerBlockFromNode(node);
-          if (blockEl) {
-            handleBlockMutation(blockEl);
-          }
-        } else if (mut.type === "childList" && mut.removedNodes.length > 0) {
-          for (const remNode of mut.removedNodes) {
-            if (remNode.nodeType === Node.ELEMENT_NODE && activeBlocks.has(remNode)) {
-              removeBlock(remNode);
-            }
-          }
-        }
-      }
+    mainObserver = new MutationObserver(() => {
+      scanAllBlocks(container);
     });
 
     mainObserver.observe(container, {
@@ -491,41 +556,24 @@
       characterData: true
     });
 
-    // Quét ban đầu nếu đã có sẵn câu tiếng Nhật trong container
-    for (const child of container.children) {
-      if (JA_REGEX.test(child.textContent || "")) {
-        handleBlockMutation(child);
-      }
-    }
+    // Quét ngay lần đầu khi vừa gắn observer
+    scanAllBlocks(container);
   }
 
-  // Scanner định kỳ (mỗi 750ms) quét chủ động các thẻ tiếng Nhật trên màn hình Meet
+  // Scanner định kỳ (mỗi 600ms) quét chủ động theo container thực tế
   function startScanner() {
     setInterval(() => {
       if (!isExtensionValid()) return;
 
       const container = findCaptionContainer();
-      if (container && container !== observedContainer) {
-        attachObserver(container);
-      }
-
-      // Quét chủ động: Tìm các phần tử chứa chữ Nhật ở nửa dưới màn hình
-      const candidates = document.querySelectorAll('span, div');
-      for (const el of candidates) {
-        if (el.closest("#gmeet-trans-host")) continue;
-        const rect = el.getBoundingClientRect();
-        if (rect.top > window.innerHeight * 0.35 && rect.height > 10) {
-          const txt = el.textContent || "";
-          if (JA_REGEX.test(txt) && el.children.length === 0) {
-            const blockEl = findSpeakerBlockFromNode(el);
-            if (blockEl) {
-              handleBlockMutation(blockEl);
-              break;
-            }
-          }
+      if (container) {
+        if (container !== observedContainer) {
+          attachObserver(container);
+        } else {
+          scanAllBlocks(container);
         }
       }
-    }, 750);
+    }, 600);
   }
 
   // =========================================================================
