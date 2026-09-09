@@ -18,8 +18,16 @@
 #trans-overlay-container {
   position: fixed;
   z-index: 2147483647; /* Đảm bảo luôn nổi trên cùng */
-  width: 580px;
-  max-width: 92vw;
+  width: 620px;
+  height: 380px;
+  min-width: 380px;
+  min-height: 200px;
+  max-width: 95vw;
+  max-height: 88vh;
+  resize: both; /* Cho phép người dùng kéo giãn cả chiều rộng và chiều cao */
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
   background: rgba(18, 20, 24, 0.88);
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
@@ -27,7 +35,6 @@
   border-radius: 14px;
   box-shadow: 0 12px 36px rgba(0, 0, 0, 0.5), 0 2px 8px rgba(0, 0, 0, 0.3);
   color: #f1f3f4;
-  overflow: hidden;
   transition: box-shadow 0.2s ease, opacity 0.25s ease;
   user-select: none;
 }
@@ -47,6 +54,7 @@
   background: rgba(32, 36, 42, 0.85);
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
   cursor: grab;
+  flex-shrink: 0;
 }
 
 .overlay-header:active {
@@ -60,11 +68,12 @@
 }
 
 .status-dot {
-  width: 9px;
-  height: 9px;
+  width: 10px;
+  height: 10px;
   border-radius: 50%;
   background-color: #ea4335; /* Đỏ = mất kết nối */
   transition: background-color 0.3s ease;
+  cursor: pointer;
 }
 
 .status-dot.connected {
@@ -116,10 +125,11 @@
   color: #ffffff;
 }
 
-/* Danh sách phụ đề */
+/* Danh sách phụ đề: Tự động co giãn theo chiều cao cửa sổ và cuộn dọc mượt mà */
 .subtitles-body {
   padding: 12px 14px;
-  max-height: 280px;
+  flex: 1;
+  min-height: 120px;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
@@ -128,16 +138,32 @@
   scroll-behavior: smooth;
 }
 
-/* Scrollbar tinh tế */
+/* Scrollbar tinh tế, rõ ràng và dễ cuộn */
 .subtitles-body::-webkit-scrollbar {
-  width: 5px;
+  width: 8px;
 }
 .subtitles-body::-webkit-scrollbar-track {
-  background: transparent;
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 8px;
 }
 .subtitles-body::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.2);
-  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.25);
+  border-radius: 8px;
+}
+.subtitles-body::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.45);
+}
+
+/* Góc kéo giãn kích thước (Resize Corner Indicator) */
+.resize-handle {
+  position: absolute;
+  bottom: 2px;
+  right: 2px;
+  width: 14px;
+  height: 14px;
+  cursor: se-resize;
+  pointer-events: none;
+  background: linear-gradient(135deg, transparent 40%, rgba(255, 255, 255, 0.3) 40%, rgba(255, 255, 255, 0.3) 50%, transparent 50%, transparent 70%, rgba(255, 255, 255, 0.3) 70%, rgba(255, 255, 255, 0.3) 80%, transparent 80%);
 }
 
 /* Từng dòng phụ đề */
@@ -167,7 +193,7 @@
 .subtitle-card.interim {
   border-left-color: #fbbc04;
   background: rgba(251, 188, 4, 0.06);
-  opacity: 0.85;
+  opacity: 0.9;
 }
 
 .subtitle-meta {
@@ -195,9 +221,9 @@
 
 /* Câu tiếng Nhật gốc */
 .original-text {
-  font-size: 12px;
+  font-size: 13px;
   color: #9aa0a6;
-  line-height: 1.4;
+  line-height: 1.45;
   word-break: break-word;
 }
 
@@ -218,12 +244,16 @@
 
 /* Chế độ thu nhỏ (Minimized) */
 #trans-overlay-container.minimized {
-  width: auto;
+  width: auto !important;
+  height: auto !important;
   min-width: 190px;
+  min-height: unset;
+  resize: none !important;
 }
 
-#trans-overlay-container.minimized .subtitles-body {
-  display: none;
+#trans-overlay-container.minimized .subtitles-body,
+#trans-overlay-container.minimized .resize-handle {
+  display: none !important;
 }
 
 #trans-overlay-container.minimized .header-left .app-title {

@@ -9,8 +9,15 @@
     "alarms"
   ],
   "host_permissions": [
-    "<all_urls>"
+    "<all_urls>",
+    "http://127.0.0.1:*/*",
+    "http://localhost:*/*",
+    "ws://127.0.0.1:*/*",
+    "ws://localhost:*/*"
   ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' http://localhost:* http://127.0.0.1:*; object-src 'self'; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:* http://localhost:* ws://localhost:*;"
+  },
   "background": {
     "service_worker": "background.js"
   },

@@ -1,22 +1,19 @@
 /**
  * Google Meet JA-VI Live Translator - Content Script (Refactored Block-Level Architecture)
  *
- * KIẾN TRÚC MỚI: Quản lý độc lập theo từng Speaker Block trong DOM của Google Meet.
- * 1. Không dùng biến toàn cục để lưu text hay timer của cả cuộc họp.
- * 2. Mỗi Speaker Block (DOM Node) có một BlockState riêng (blockId, timers, seq, card UI).
- * 3. Ngăn ngừa triệt để việc ghép nhầm text giữa các người nói (Bug 4).
- * 4. Chống stale response bằng activeRequestId và lifecycle riêng của từng block (Bug 2).
- * 5. Tự động xử lý khi Meet gỡ bỏ block (childList mutation) để chốt câu an toàn.
- * 6. Shadow DOM Overlay hiển thị mượt mà với 2 chế độ (Chỉ Tiếng Việt / Song ngữ).
- * 7. Dual-Transport: Gửi qua WebSocket Port hoặc HTTP Message Fallback, không bao giờ rơi rớt dữ liệu.
- * 8. Khắc phục triệt để lỗi kẹt "Đang dịch..." bằng việc chỉ tạo card khi có text thực tế.
+ * KIẾN TRÚC BLOCK-LEVEL & NÂNG CẤP TRẢI NGHIỆM NGƯỜI DÙNG:
+ * 1. Độc lập theo từng Speaker Block: Mỗi người nói có BlockState riêng, không nhầm lẫn text.
+ * 2. Hỗ trợ cuộn dọc (Scroll-Y) xem toàn bộ lịch sử phụ đề với cơ chế Smart Auto-Scroll.
+ * 3. Cho phép kéo giãn kích thước (Resize Width/Height) tự do và tự động lưu kích thước.
+ * 4. Dual-Transport: Kết hợp WebSocket tốc độ cao và HTTP Fallback tự động.
+ * 5. Cơ chế Active Retry (2.5s) đảm bảo 100% không bao giờ bị kẹt "Đang dịch...".
  */
 
 (() => {
   if (window.__GMEET_JA_VI_INJECTED__) return;
   window.__GMEET_JA_VI_INJECTED__ = true;
 
-  console.log("%c[JA-VI Translator]%c Khởi động với Kiến trúc Block-Level...", "color: #1a73e8; font-weight: bold;", "color: inherit;");
+  console.log("%c[JA-VI Translator]%c Khởi động với Kiến trúc Block-Level & Resizable UI...", "color: #1a73e8; font-weight: bold;", "color: inherit;");
 
   // Cấu hình phiên làm việc
   const sessionId = "meet_" + Math.random().toString(36).substring(2, 9) + "_" + Date.now();
@@ -24,14 +21,14 @@
   let bgPort = null;
   let isConnectedToServer = false;
 
-  // Cài đặt người dùng
+  // Cài đặt người dùng (Lưu tối đa 80 câu để cuộn xem toàn bộ hội thoại cuộc họp)
   let settings = {
     enabled: true,
     displayMode: "both", // "both" (Song ngữ Cả 2) hoặc "vi_only" (Chỉ Tiếng Việt)
     enableInterim: true,
     fontSize: "medium",  // small, medium, large
-    autoFadeSeconds: 25,
-    maxCards: 8
+    autoFadeSeconds: 0,  // 0 = Không làm mờ chữ, giữ lịch sử rõ ràng để đọc
+    maxCards: 80         // Lưu tới 80 câu để người dùng thoải mái cuộn xem
   };
 
   // Shadow DOM Host & Elements
@@ -70,7 +67,6 @@
 
       bgPort.onDisconnect.addListener(() => {
         bgPort = null;
-        // Chỉ thử kết nối lại nếu extension context vẫn hợp lệ
         if (isExtensionValid()) {
           setTimeout(setupBackgroundPort, 2000);
         }
@@ -82,6 +78,20 @@
       }, 2000);
     }
   }
+
+  // Lắng nghe tin nhắn broadcast dự phòng từ Background qua Runtime Message
+  try {
+    if (isExtensionValid() && chrome.runtime?.onMessage) {
+      chrome.runtime.onMessage.addListener((msg) => {
+        if (msg.type === "CONNECTION_STATUS") {
+          isConnectedToServer = Boolean(msg.connected);
+          updateUiConnectionStatus(msg.connected);
+        } else if (msg.type === "TRANSLATION_RESULT") {
+          handleTranslationResult(msg.payload);
+        }
+      });
+    }
+  } catch (e) {}
 
   /**
    * Định kỳ đồng bộ trạng thái kết nối với Background Service Worker
@@ -106,7 +116,6 @@
     if (!settings.enabled || !blockState.lastObservedText || !blockState.lastObservedText.trim()) return;
 
     const currentText = blockState.lastObservedText.trim();
-    // Bỏ qua nếu text chỉ là icon hoặc rác hệ thống
     if (/^(mic_none|mic_off|arrow_downward|closed_caption|volume_up|more_vert)\b/i.test(currentText)) return;
     if (currentText.length === 0) return;
 
@@ -149,7 +158,7 @@
       }
     }
 
-    // Nếu Port không gửi được, Fallback gửi qua sendMessage tức thì
+    // Nếu Port chưa gửi được, Fallback gửi ngay qua sendMessage
     if (!sent && isExtensionValid()) {
       try {
         chrome.runtime.sendMessage({ action: "TRANSLATE", payload: payload }, (res) => {
@@ -172,9 +181,7 @@
   // 2. Mô hình State Machine Theo Từng Speaker Block
   // =========================================================================
 
-  // Map liên kết giữa DOM Element của Speaker Block và BlockState của nó
   const activeBlocks = new Map();
-  // Map phụ tra cứu nhanh bằng blockId
   const blocksById = new Map();
 
   function createBlockState(element, initialSpeaker) {
@@ -203,10 +210,6 @@
     blocksById.set(blockId, state);
 
     console.log(`%c[JA-VI][BLOCK CREATED]%c ID: ${blockId} | Speaker: "${state.speaker}"`, "color: #1a73e8; font-weight: bold;", "color: inherit;");
-
-    // LƯU Ý: Tuyệt đối KHÔNG tạo thẻ card rác ở đây khi chưa có text!
-    // Thẻ card sẽ chỉ được tạo khi phát hiện text thực sự trong getOrCreateOverlayCard().
-
     return state;
   }
 
@@ -222,7 +225,6 @@
       blockState.interimTimer = null;
     }
 
-    // Nếu còn text chưa chốt, gửi request final
     if (blockState.lastObservedText && blockState.lastObservedText !== blockState.committedText) {
       sendTranslationRequest(blockState, "final");
     }
@@ -236,12 +238,11 @@
 
     finalizeBlock(blockState);
     blockState.isFinalized = true;
-
     activeBlocks.delete(element);
 
     setTimeout(() => {
       blocksById.delete(blockState.blockId);
-    }, 12000);
+    }, 15000);
   }
 
   // =========================================================================
@@ -249,7 +250,6 @@
   // =========================================================================
 
   function findCaptionContainer() {
-    // 1. Thử các selector vùng chứa phụ đề chính của Google Meet
     const specificSelectors = [
       'div[jscontroller="D1tHje"]',
       '.a4bvKc',
@@ -269,14 +269,12 @@
       }
     }
 
-    // 2. Nếu tìm thấy .nMDOkf hoặc [jsname="YSxPC"] (hàng phụ đề), lấy container cha chứa tất cả hàng
     const rowEl = document.querySelector('.nMDOkf, [jsname="YSxPC"]');
     if (rowEl) {
       const parent = rowEl.closest('.a4bvKc') || rowEl.closest('div[jscontroller="D1tHje"]') || rowEl.parentElement;
       if (parent) return parent;
     }
 
-    // 3. Dự phòng aria-live (loại bỏ modal, snackbar, toast, nút cuộn)
     const liveElements = document.querySelectorAll('[aria-live="polite"], [aria-live="assertive"]');
     for (const el of liveElements) {
       if (el.closest('[role="status"], [role="alert"], .M9Bg4d, .eO2Zfd, [data-mdc-dialog-action]')) continue;
@@ -291,16 +289,12 @@
     return null;
   }
 
-  /**
-   * Xác định phần tử Speaker Block đại diện cho một mutation target trong container
-   */
   function getSpeakerBlockElement(targetNode, container) {
     if (!targetNode || !container || targetNode === container) return null;
 
     let curr = targetNode.nodeType === Node.ELEMENT_NODE ? targetNode : targetNode.parentElement;
     if (!curr || !container.contains(curr)) return null;
 
-    // Duyệt ngược lên cho tới khi phần tử cha là container
     while (curr && curr.parentElement) {
       if (curr.parentElement === container) {
         return curr;
@@ -315,7 +309,8 @@
 
   /**
    * Trích xuất tên người nói và văn bản phụ đề CHÍNH XÁC từ blockElement
-   * Đã loại bỏ các selector chung chung như [class*="name" i] để không xoá nhầm chữ Nhật!
+   * LUÔN dùng clone toàn khối làm phương án duy nhất, loại bỏ avatar & phần tử tên,
+   * lấy phần text còn lại là câu nói tiếng Nhật.
    */
   function extractBlockData(blockElement) {
     if (!blockElement) return { speaker: "Người tham gia", text: "" };
@@ -353,7 +348,6 @@
     if (speakerName && text.startsWith(speakerName) && text.length > speakerName.length) {
       text = text.substring(speakerName.length).trim();
     } else if (speakerName && text === speakerName) {
-      // Nếu text sau khi lọc chỉ đúng bằng tên người nói -> Chưa có câu nói thực sự
       text = "";
     }
 
@@ -369,8 +363,6 @@
   function handleBlockMutation(blockElement) {
     const { speaker, text } = extractBlockData(blockElement);
 
-    // QUAN TRỌNG: Nếu chưa có text thực tế hoặc text rỗng -> BỎ QUA HOÀN TOÀN!
-    // Tránh sinh card rác hiển thị "Đang dịch..." trên UI.
     if (!text || !text.trim() || text.length === 0) {
       const existingState = activeBlocks.get(blockElement);
       if (existingState && existingState.lastObservedText) {
@@ -388,7 +380,6 @@
       updateCardSpeaker(blockState);
     }
 
-    // Nếu nội dung text không đổi so với lần trước, bỏ qua
     if (text === blockState.lastObservedText) return;
 
     blockState.lastObservedText = text;
@@ -397,7 +388,7 @@
     // Hiển thị / cập nhật thẻ trên UI với câu gốc tiếng Nhật ngay lập tức
     getOrCreateOverlayCard(blockState, text);
 
-    // Xử lý gửi bản dịch nháp (Interim)
+    // Gửi bản dịch nháp (Interim)
     if (settings.enableInterim) {
       const charDiff = Math.abs(text.length - blockState.lastSentInterimText.length);
       if (text.length >= 3 && charDiff >= 2) {
@@ -411,7 +402,7 @@
       }
     }
 
-    // Đặt lại Debounce chốt câu (Final) cho riêng block này
+    // Đặt Debounce chốt câu (Final) cho riêng block này
     if (blockState.debounceTimer) clearTimeout(blockState.debounceTimer);
     blockState.debounceTimer = setTimeout(() => {
       blockState.debounceTimer = null;
@@ -436,7 +427,6 @@
 
     mainObserver = new MutationObserver((mutations) => {
       for (const mut of mutations) {
-        // 1. Kiểm tra các block bị gỡ bỏ khỏi DOM
         if (mut.type === "childList" && mut.removedNodes.length > 0) {
           for (const node of mut.removedNodes) {
             if (node.nodeType === Node.ELEMENT_NODE) {
@@ -453,7 +443,6 @@
           }
         }
 
-        // 2. Xác định Speaker Block chứa mutation và xử lý
         const blockEl = getSpeakerBlockElement(mut.target, container);
         if (blockEl) {
           handleBlockMutation(blockEl);
@@ -476,7 +465,6 @@
       characterData: true
     });
 
-    // Quét ban đầu xem đã có block nào sẵn chưa
     for (const child of container.children) {
       handleBlockMutation(child);
     }
@@ -500,8 +488,24 @@
   }
 
   // =========================================================================
-  // 4. Quản Lý Thẻ Overlay UI (Chỉ hiển thị khi có text thực tế)
+  // 4. Quản Lý Thẻ Overlay UI & Cơ Chế Cuộn Thông Minh (Smart Auto-Scroll)
   // =========================================================================
+
+  /**
+   * Cuộn danh sách phụ đề xuống dưới cùng một cách thông minh:
+   * Nếu người dùng đang cuộn lên trên để đọc lịch sử cũ, KHÔNG giật cuộn xuống!
+   */
+  function scrollSubtitlesToBottom(force = false) {
+    if (!subtitlesBody) return;
+    if (force) {
+      subtitlesBody.scrollTop = subtitlesBody.scrollHeight;
+      return;
+    }
+    const isUserScrolledUp = (subtitlesBody.scrollHeight - subtitlesBody.scrollTop - subtitlesBody.clientHeight) > 70;
+    if (!isUserScrolledUp) {
+      subtitlesBody.scrollTop = subtitlesBody.scrollHeight;
+    }
+  }
 
   /**
    * Lấy hoặc tạo thẻ phụ đề trên Overlay UI - ĐẢM BẢO LUÔN CÓ TEXT GỐC
@@ -524,10 +528,39 @@
       `;
       subtitlesBody.appendChild(card);
       blockState.cardElement = card;
-      subtitlesBody.scrollTop = subtitlesBody.scrollHeight;
+      scrollSubtitlesToBottom(false);
       trimOldCards();
 
-      // CƠ CHẾ BẢO VỆ CHỐNG KẸT: Nếu sau 7s chưa có bản dịch, tự động gỡ mác "Đang dịch..."
+      // CƠ CHẾ ACTIVE RETRY: Nếu sau 2.5s mà vẫn còn "...", kích hoạt ngay Fallback HTTP trực tiếp!
+      setTimeout(() => {
+        if (card && card.parentElement) {
+          const transEl = card.querySelector(".translated-text");
+          if (transEl && transEl.textContent === "...") {
+            console.log(`[JA-VI] Tự động kích hoạt Fallback HTTP cho thẻ [${blockState.blockId}]`);
+            if (isExtensionValid()) {
+              chrome.runtime.sendMessage({
+                action: "TRANSLATE",
+                payload: {
+                  type: "final",
+                  session_id: sessionId,
+                  block_id: blockState.blockId,
+                  req_id: blockState.activeRequestId,
+                  seq: blockState.blockSeq || 1,
+                  speaker: blockState.speaker,
+                  text: blockState.lastObservedText || text,
+                  timestamp: Date.now()
+                }
+              }, (res) => {
+                if (res && res.data) {
+                  handleTranslationResult(res.data);
+                }
+              });
+            }
+          }
+        }
+      }, 2500);
+
+      // Timeout an toàn gỡ nhãn "Đang dịch..." nếu mạng bị mất
       setTimeout(() => {
         if (card && card.parentElement) {
           const lat = card.querySelector(".latency-label");
@@ -535,12 +568,13 @@
             lat.textContent = "AI";
           }
         }
-      }, 7000);
+      }, 8000);
     } else {
       const origEl = card.querySelector(".original-text");
       if (origEl && text) origEl.textContent = text;
       const spEl = card.querySelector(".speaker-label");
       if (spEl && blockState.speaker) spEl.textContent = blockState.speaker;
+      scrollSubtitlesToBottom(false);
     }
 
     return card;
@@ -610,14 +644,14 @@
       subtitlesBody.appendChild(card);
     }
 
-    subtitlesBody.scrollTop = subtitlesBody.scrollHeight;
+    scrollSubtitlesToBottom(false);
     trimOldCards();
 
-    // Hẹn giờ làm mờ thẻ sau khi câu đã được chốt (final)
+    // Hẹn giờ làm mờ thẻ (chỉ áp dụng nếu autoFadeSeconds > 0)
     if (type === "final" && settings.autoFadeSeconds > 0) {
       setTimeout(() => {
         if (card && card.parentElement) {
-          card.style.opacity = "0.35";
+          card.style.opacity = "0.45";
         }
       }, settings.autoFadeSeconds * 1000);
     }
@@ -631,7 +665,8 @@
 
   function trimOldCards() {
     if (!subtitlesBody) return;
-    while (subtitlesBody.children.length > settings.maxCards) {
+    const max = settings.maxCards || 80;
+    while (subtitlesBody.children.length > max) {
       const firstChild = subtitlesBody.firstElementChild;
       if (firstChild) {
         firstChild.remove();
@@ -652,7 +687,7 @@
   }
 
   // =========================================================================
-  // 5. Xây dựng Overlay UI trong Shadow DOM (Cách Ly & 2 Chế Độ Phụ Đề)
+  // 5. Xây dựng Overlay UI trong Shadow DOM (Kéo Giãn, Di Chuyển & 2 Chế Độ)
   // =========================================================================
 
   async function createOverlayUi() {
@@ -673,9 +708,9 @@
     overlayContainer.id = "trans-overlay-container";
     overlayContainer.className = `font-${settings.fontSize}`;
 
-    // Khôi phục cài đặt và vị trí
+    // Khôi phục cài đặt, vị trí và kích thước cửa sổ đã lưu
     try {
-      const stored = await chrome.storage.local.get(["overlayPos", "settings"]);
+      const stored = await chrome.storage.local.get(["overlayPos", "overlaySize", "settings"]);
       if (stored.settings) {
         settings = { ...settings, ...stored.settings };
         if (stored.settings.showOriginal === false) {
@@ -683,6 +718,17 @@
         }
         overlayContainer.className = `font-${settings.fontSize} ${settings.displayMode === "vi_only" ? "mode-vi-only" : ""}`;
       }
+
+      // Khôi phục kích thước rộng x cao
+      if (stored.overlaySize && stored.overlaySize.width && stored.overlaySize.height) {
+        overlayContainer.style.width = stored.overlaySize.width + "px";
+        overlayContainer.style.height = stored.overlaySize.height + "px";
+      } else {
+        overlayContainer.style.width = "620px";
+        overlayContainer.style.height = "380px";
+      }
+
+      // Khôi phục vị trí
       if (stored.overlayPos) {
         overlayContainer.style.top = stored.overlayPos.top + "px";
         overlayContainer.style.left = stored.overlayPos.left + "px";
@@ -693,12 +739,14 @@
     } catch (e) {
       overlayContainer.style.bottom = "90px";
       overlayContainer.style.left = "24px";
+      overlayContainer.style.width = "620px";
+      overlayContainer.style.height = "380px";
     }
 
     overlayContainer.innerHTML = `
       <div class="overlay-header">
         <div class="header-left">
-          <div class="status-dot ${isConnectedToServer ? "connected" : ""}" id="status-indicator" title="${isConnectedToServer ? "Đã kết nối Server" : "Chưa kết nối Server"}"></div>
+          <div class="status-dot ${isConnectedToServer ? "connected" : ""}" id="status-indicator" title="${isConnectedToServer ? "Đã kết nối Server" : "Chưa kết nối Server (Nhấp để kết nối lại)"}"></div>
           <span class="app-title">Phụ đề Nhật - Việt AI</span>
           <span class="badge-tag">NLLB-200</span>
         </div>
@@ -723,6 +771,7 @@
           </div>
         </div>
       </div>
+      <div class="resize-handle" title="Kéo để thay đổi kích thước"></div>
     `;
 
     shadowRoot.appendChild(overlayContainer);
@@ -732,36 +781,25 @@
     btnModeToggle = shadowRoot.getElementById("btn-mode-toggle");
     btnServerPower = shadowRoot.getElementById("btn-server-power");
 
-    // Click vào status dot để kết nối lại
-    if (statusDot) {
-      statusDot.style.cursor = "pointer";
-      statusDot.addEventListener("click", () => {
-        if (!isExtensionValid()) return;
-        chrome.runtime.sendMessage({ action: "CONNECT" }, (res) => {
-          if (res) updateUiConnectionStatus(res.connected);
-        });
-      });
-    }
-
-    if (btnServerPower) {
-      btnServerPower.addEventListener("click", async () => {
-        if (!isExtensionValid()) return;
-        btnServerPower.textContent = "⏳...";
-        try {
-          if (isConnectedToServer) {
-            await chrome.runtime.sendMessage({ action: "DISCONNECT" });
-            updateUiConnectionStatus(false);
-          } else {
-            const res = await chrome.runtime.sendMessage({ action: "CONNECT" });
-            if (res) {
-              updateUiConnectionStatus(res.connected);
-            }
-          }
-        } catch (e) {
+    // Click vào status dot hoặc nút power để kết nối lại
+    const triggerConnect = async () => {
+      if (!isExtensionValid()) return;
+      if (btnServerPower) btnServerPower.textContent = "⏳...";
+      try {
+        if (isConnectedToServer) {
+          await chrome.runtime.sendMessage({ action: "DISCONNECT" });
           updateUiConnectionStatus(false);
+        } else {
+          const res = await chrome.runtime.sendMessage({ action: "CONNECT" });
+          if (res) updateUiConnectionStatus(res.connected);
         }
-      });
-    }
+      } catch (e) {
+        updateUiConnectionStatus(false);
+      }
+    };
+
+    if (statusDot) statusDot.addEventListener("click", triggerConnect);
+    if (btnServerPower) btnServerPower.addEventListener("click", triggerConnect);
 
     function applyDisplayMode(mode) {
       settings.displayMode = mode;
@@ -807,6 +845,28 @@
     });
 
     enableDraggable(overlayContainer, shadowRoot.querySelector(".overlay-header"));
+
+    // Tự động theo dõi và lưu kích thước kéo giãn (Resize) của người dùng
+    if (typeof ResizeObserver !== "undefined") {
+      let resizeSaveTimer = null;
+      const resizeObserver = new ResizeObserver((entries) => {
+        for (const entry of entries) {
+          if (!overlayContainer.classList.contains("minimized") && isExtensionValid()) {
+            const width = Math.round(entry.contentRect.width);
+            const height = Math.round(entry.contentRect.height);
+            if (width > 250 && height > 150) {
+              clearTimeout(resizeSaveTimer);
+              resizeSaveTimer = setTimeout(() => {
+                chrome.storage.local.set({
+                  overlaySize: { width, height }
+                }).catch(() => {});
+              }, 400);
+            }
+          }
+        }
+      });
+      resizeObserver.observe(overlayContainer);
+    }
   }
 
   function updateUiConnectionStatus(connected) {
@@ -917,14 +977,14 @@
   createOverlayUi();
   startScanner();
 
-  // Định kỳ kiểm tra trạng thái kết nối máy chủ mỗi 4s
+  // Định kỳ kiểm tra trạng thái kết nối máy chủ mỗi 3s
   setInterval(() => {
     syncServerStatus();
-  }, 4000);
+  }, 3000);
 
   // Đồng bộ trạng thái ban đầu ngay sau khi nạp UI
   setTimeout(() => {
     syncServerStatus();
-  }, 500);
+  }, 400);
 
 })();

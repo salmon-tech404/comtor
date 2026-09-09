@@ -135,15 +135,29 @@ function scheduleReconnect() {
 }
 
 /**
- * Gửi thông điệp tới tất cả các tab Google Meet đang kết nối
+ * Gửi thông điệp tới tất cả các tab Google Meet đang kết nối (Port + Tab Message)
  */
-function broadcastToTabs(message) {
+async function broadcastToTabs(message) {
+  let sentToPort = false;
   for (const port of activePorts) {
     try {
       port.postMessage(message);
+      sentToPort = true;
     } catch (e) {
       activePorts.delete(port);
     }
+  }
+
+  // Dự phòng nếu Port bị gián đoạn: Gửi trực tiếp qua chrome.tabs.sendMessage
+  if (chrome.tabs) {
+    try {
+      const tabs = await chrome.tabs.query({ url: "https://meet.google.com/*" });
+      for (const tab of tabs) {
+        if (tab.id) {
+          chrome.tabs.sendMessage(tab.id, message).catch(() => {});
+        }
+      }
+    } catch (err) {}
   }
 }
 
