@@ -257,33 +257,71 @@
    * Hỗ trợ cuộc họp thông thường, trình bày màn hình (Presentation), và PiP
    */
   function findCaptionContainer() {
-    // 1. Container chuẩn của Google Meet: luôn là .a4bvKc hoặc div[jscontroller="D1tHje"]
-    const primary = document.querySelector('.a4bvKc, div[jscontroller="D1tHje"]');
-    if (primary && !primary.closest("#gmeet-trans-host") && !primary.closest('[role="dialog"]')) {
-      return primary;
+    // 1. ƯU TIÊN SỐ 1: Dynamic Scanner - Tìm container từ các phần tử lá chứa chữ tiếng Nhật thực tế
+    // Đây là phương pháp chắc chắn 100%, miễn nhiễm hoàn toàn với mọi thay đổi class name của Google Meet
+    const allLeafs = Array.from(
+      document.querySelectorAll('body *:not(script):not(style):not(dialog):not([role="dialog"]):not([role="menu"])')
+    ).filter((el) => {
+      if (el.children.length !== 0 || el.offsetHeight <= 0) return false;
+      if (el.closest("#gmeet-trans-host")) return false;
+      if (el.closest('button, [role="button"], [role="toolbar"], [role="menu"], [role="tooltip"], [tooltip-id]')) return false;
+      const text = (el.textContent || "").trim();
+      if (!JA_REGEX.test(text)) return false;
+      const rect = el.getBoundingClientRect();
+      // Phụ đề Meet luôn hiển thị ở nửa dưới hoặc giữa màn hình (top > 25% chiều cao màn hình)
+      return rect.top > window.innerHeight * 0.25 && rect.height > 5;
+    });
+
+    if (allLeafs.length > 0) {
+      // Tìm container chung thấp nhất bao bọc tất cả các dòng phụ đề tiếng Nhật đang có
+      let container = allLeafs[0].parentElement;
+      while (container && container !== document.body) {
+        if (container.classList.contains("a4bvKc") || container.getAttribute("role") === "region") {
+          return container;
+        }
+        const containsAll = allLeafs.every((leaf) => container.contains(leaf));
+        if (containsAll && container.offsetHeight < window.innerHeight * 0.7) {
+          return container;
+        }
+        container = container.parentElement;
+      }
+      // Dự phòng: lấy cha gần nhất của leaf đầu tiên
+      const candidate = allLeafs[0].closest(".a4bvKc, .nMDOkf");
+      if (candidate) return candidate.parentElement || candidate;
+      return allLeafs[0].parentElement;
     }
 
-    // 2. Tìm theo phần tử dòng chữ phụ đề của Meet (.iTTPOb, [jsname="tgaKEf"])
+    // 2. Dự phòng khi chưa có ai nói: Container rỗng chuẩn của Google Meet (.a4bvKc)
+    // TUYỆT ĐỐI KHÔNG chọn các nút bấm / thanh công cụ ở thanh điều khiển dưới đáy
+    const staticPrimary = document.querySelector(".a4bvKc");
+    if (staticPrimary && 
+        !staticPrimary.closest("#gmeet-trans-host") && 
+        !staticPrimary.closest('[role="dialog"]') &&
+        !staticPrimary.closest('[role="toolbar"]') &&
+        !staticPrimary.hasAttribute("tooltip-id") &&
+        !staticPrimary.querySelector('[tooltip-id^="ucc"]')) {
+      return staticPrimary;
+    }
+
+    // 3. Tìm qua line element phụ đề (.iTTPOb, [jsname="tgaKEf"])
     const lineEl = document.querySelector('.iTTPOb, [jsname="tgaKEf"]');
     if (lineEl && !lineEl.closest("#gmeet-trans-host") && !lineEl.closest('[role="dialog"]')) {
-      const container = lineEl.closest('.a4bvKc') || lineEl.closest('div[jscontroller="D1tHje"]') || lineEl.closest('.nMDOkf')?.parentElement;
-      if (container && container !== document.body && !container.closest('[role="dialog"]')) {
-        console.log("[JA-VI][DEBUG] Container tìm thấy qua lineEl .iTTPOb:", container);
+      const container = lineEl.closest(".a4bvKc") || lineEl.closest(".nMDOkf")?.parentElement || lineEl.parentElement;
+      if (container && container !== document.body && !container.closest('[role="dialog"]') && !container.querySelector('[tooltip-id^="ucc"]')) {
         return container;
       }
     }
 
-    // 3. Tìm thông qua hàng speaker đặc trưng của Google Meet (.nMDOkf, [jsname="YSxPC"])
+    // 4. Tìm qua hàng speaker đặc trưng của Google Meet (.nMDOkf, [jsname="YSxPC"])
     const rowEl = document.querySelector('.nMDOkf, [jsname="YSxPC"]');
     if (rowEl && !rowEl.closest("#gmeet-trans-host") && !rowEl.closest('[role="dialog"]')) {
-      const parent = rowEl.closest('.a4bvKc') || rowEl.closest('div[jscontroller="D1tHje"]') || rowEl.parentElement;
-      if (parent && parent !== document.body && !parent.closest('[role="dialog"]')) {
-        console.log("[JA-VI][DEBUG] Container tìm thấy qua rowEl .nMDOkf:", parent);
+      const parent = rowEl.closest(".a4bvKc") || rowEl.parentElement;
+      if (parent && parent !== document.body && !parent.closest('[role="dialog"]') && !parent.querySelector('[tooltip-id^="ucc"]')) {
         return parent;
       }
     }
 
-    // 4. Region phụ đề rõ ràng
+    // 5. Region phụ đề rõ ràng
     const regionSelectors = [
       '[role="region"][aria-label*="caption" i]',
       '[role="region"][aria-label*="phụ đề" i]',
@@ -292,34 +330,8 @@
     ];
     for (const sel of regionSelectors) {
       const el = document.querySelector(sel);
-      if (el && !el.closest("#gmeet-trans-host") && !el.closest('[role="dialog"]')) {
-        console.log("[JA-VI][DEBUG] Container tìm thấy qua region selector:", sel, el);
+      if (el && !el.closest("#gmeet-trans-host") && !el.closest('[role="dialog"]') && !el.querySelector('[tooltip-id^="ucc"]')) {
         return el;
-      }
-    }
-
-    // 5. Dynamic Scanner: Tự động tìm container bao bọc các phần tử lá chứa chữ tiếng Nhật thật sự
-    // Bảo đảm 100% tìm thấy ngay cả khi Google Meet thay đổi / mã hóa toàn bộ class name
-    const allLeafs = document.querySelectorAll('body *:not(script):not(style):not(dialog):not([role="dialog"]):not([role="menu"])');
-    for (const el of allLeafs) {
-      if (el.children.length === 0 && el.offsetHeight > 0 && JA_REGEX.test(el.textContent || "")) {
-        if (el.closest("#gmeet-trans-host")) continue;
-        const rect = el.getBoundingClientRect();
-        if (rect.top > window.innerHeight * 0.35 && rect.height > 5) {
-          let candidate = el.parentElement;
-          while (candidate && candidate !== document.body) {
-            if (candidate.classList.contains("a4bvKc") || candidate.classList.contains("nMDOkf") || candidate.hasAttribute("jscontroller") || candidate.getAttribute("role") === "region") {
-              const res = candidate.classList.contains("nMDOkf") ? (candidate.parentElement || candidate) : candidate;
-              console.log("[JA-VI][DEBUG] Container tìm thấy qua Dynamic Leaf Scanner (class):", res);
-              return res;
-            }
-            if (candidate.children.length > 1 && candidate.offsetHeight < 350 && candidate.getBoundingClientRect().top > window.innerHeight * 0.35) {
-              console.log("[JA-VI][DEBUG] Container tìm thấy qua Dynamic Leaf Scanner (structural parent):", candidate);
-              return candidate;
-            }
-            candidate = candidate.parentElement;
-          }
-        }
       }
     }
 
@@ -336,6 +348,10 @@
       c => !(c.closest && c.closest('#gmeet-trans-host')) && 
            !c.closest('[role="dialog"]') && 
            !c.closest('[role="menu"]') &&
+           !c.closest('[role="toolbar"]') &&
+           !c.hasAttribute('tooltip-id') &&
+           !c.querySelector('[tooltip-id^="ucc"]') &&
+           c.getAttribute('role') !== 'button' &&
            c.offsetHeight > 0
     );
 
@@ -345,6 +361,10 @@
         c => !(c.closest && c.closest('#gmeet-trans-host')) && 
              !c.closest('[role="dialog"]') && 
              !c.closest('[role="menu"]') &&
+             !c.closest('[role="toolbar"]') &&
+             !c.hasAttribute('tooltip-id') &&
+             !c.querySelector('[tooltip-id^="ucc"]') &&
+             c.getAttribute('role') !== 'button' &&
              c.offsetHeight > 0
       );
       if (innerList.length > 0) return innerList;
@@ -365,6 +385,11 @@
    */
   function extractBlockData(blockElement) {
     if (!blockElement) return { speaker: "Người tham gia", text: "" };
+
+    // Bảo vệ: Bỏ qua ngay nếu là nút điều khiển hoặc thanh công cụ
+    if (blockElement.hasAttribute && (blockElement.hasAttribute('tooltip-id') || blockElement.closest('[role="toolbar"]'))) {
+      return { speaker: "Người tham gia", text: "" };
+    }
 
     let speakerName = "";
 
@@ -400,38 +425,43 @@
     if (captionEl) {
       text = (captionEl.innerText || captionEl.textContent || "").trim();
     } else {
-      // 5. Tìm trực tiếp từ các phần tử lá chứa chữ Nhật bên trong blockElement (Bảo đảm 100% không trượt)
-      const jaLeafs = Array.from(blockElement.querySelectorAll('*')).filter(el => 
-        el.children.length === 0 && 
-        JA_REGEX.test(el.textContent || "") &&
-        !el.closest('button, [role="button"], script, style, [role="dialog"], [role="menu"]')
-      );
-
-      if (jaLeafs.length > 0) {
-        text = jaLeafs.map(el => el.textContent.trim()).join(" ").trim();
+      // 5. Nếu chính blockElement là node lá chứa chữ Nhật
+      if (blockElement.children.length === 0 && JA_REGEX.test(blockElement.textContent || "")) {
+        text = (blockElement.textContent || "").trim();
       } else {
-        // 6. Dự phòng: dùng clone nhưng loại trừ triệt để UI/scripts
-        const clone = blockElement.cloneNode(true);
-        clone.querySelectorAll(
-          "script, style, noscript, template, dialog, [role='dialog'], [role='menu'], [role='listbox'], [role='tooltip'], nav, header, img, svg, button, [role='button'], i, .google-material-icons, .material-icons, [class*='icon' i], [jsname='W297wb'], .ygicle, [data-self-name]"
-        ).forEach((el) => el.remove());
+        // Tìm trực tiếp từ các phần tử lá chứa chữ Nhật bên trong blockElement (Bảo đảm 100% không trượt)
+        const jaLeafs = Array.from(blockElement.querySelectorAll('*')).filter(el => 
+          el.children.length === 0 && 
+          JA_REGEX.test(el.textContent || "") &&
+          !el.closest('button, [role="button"], script, style, [role="dialog"], [role="menu"], [tooltip-id]')
+        );
 
-        text = clone.innerText || clone.textContent || "";
-        text = text.replace(/^(mic_none|mic_off|arrow_downward|closed_caption|volume_up|more_vert|videocam|call_end)\s*/gi, "");
-        text = text.replace(/[\r\n]+/g, " ").trim();
-        text = text.replace(/^(Bản trình bày của bạn|Your presentation|プレゼンテーション)\s*[:：\-]?\s*/gi, "");
+        if (jaLeafs.length > 0) {
+          text = jaLeafs.map(el => el.textContent.trim()).join(" ").trim();
+        } else {
+          // 6. Dự phòng: dùng clone nhưng loại trừ triệt để UI/scripts
+          const clone = blockElement.cloneNode(true);
+          clone.querySelectorAll(
+            "script, style, noscript, template, dialog, [role='dialog'], [role='menu'], [role='listbox'], [role='tooltip'], nav, header, img, svg, button, [role='button'], i, .google-material-icons, .material-icons, [class*='icon' i], [jsname='W297wb'], .ygicle, [data-self-name]"
+          ).forEach((el) => el.remove());
 
-        if (speakerName && text.startsWith(speakerName) && text.length > speakerName.length) {
-          text = text.substring(speakerName.length).trim();
-        } else if (speakerName && text === speakerName) {
-          text = "";
+          text = clone.innerText || clone.textContent || "";
+          text = text.replace(/^(mic_none|mic_off|arrow_downward|closed_caption|volume_up|more_vert|videocam|call_end)\s*/gi, "");
+          text = text.replace(/[\r\n]+/g, " ").trim();
+          text = text.replace(/^(Bản trình bày của bạn|Your presentation|プレゼンテーション)\s*[:：\-]?\s*/gi, "");
+
+          if (speakerName && text.startsWith(speakerName) && text.length > speakerName.length) {
+            text = text.substring(speakerName.length).trim();
+          } else if (speakerName && text === speakerName) {
+            text = "";
+          }
         }
       }
     }
 
     // 7. BỘ LỌC BẢO VỆ CHỐNG RÁC HỆ THỐNG / SCRIPT NHÚNG:
-    // Phụ đề là câu nói ngắn (dưới 350 ký tự), không bao giờ là mã nguồn hoặc danh sách cài đặt
-    if (!text || text.length > 350 || text.length < 1) {
+    // Phụ đề là câu nói ngắn (dưới 800 ký tự), không bao giờ là mã nguồn hoặc danh sách cài đặt
+    if (!text || text.length > 800 || text.length < 1) {
       return { speaker: speakerName || "Người tham gia", text: "" };
     }
     if (/Cuộc gọi này|Chi tiết về cuộc họp|Nhấn vào Mũi tên|window\.wiz|AF_initData|Tiếng Ả Rập|Trò chuyện với|Mở phần cài đặt|Bản trình bày của bạnBạn đang|Một tiện ích bổ sung|Tùy chọn khác|Rời khỏi cuộc gọi/i.test(text)) {
