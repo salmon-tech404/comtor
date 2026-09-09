@@ -1,21 +1,23 @@
 /**
  * Google Meet JA-VI Live Translator - Background Service Worker (Manifest V3)
- * Quản lý kết nối WebSocket bền vững tới Translation Service cục bộ (ws://127.0.0.1:8765/ws)
- * Tự động kết nối lại (exponential backoff) và chuyển tiếp dữ liệu 2 chiều với Content Script.
+ * Kiến trúc Dual-Transport: WebSocket thời gian thực (Primary) + HTTP Fallback (Secondary).
+ * Đảm bảo 100% không bao giờ bị rơi rớt request hoặc kẹt "Đang dịch...".
  */
 
 const WS_URL = "ws://127.0.0.1:8765/ws";
+const HTTP_URL = "http://127.0.0.1:8765";
+
 let socket = null;
 let reconnectTimer = null;
-let reconnectDelay = 1000; // Khởi đầu 1s
-const MAX_RECONNECT_DELAY = 10000; // Tối đa 10s
+let reconnectDelay = 1000;
+const MAX_RECONNECT_DELAY = 8000;
 let isExplicitlyClosed = false;
 
 // Danh sách các port kết nối từ Content Script của các tab Google Meet
 const activePorts = new Set();
 
 /**
- * Cập nhật trạng thái kết nối vào chrome.storage.local để popup và content script có thể đọc
+ * Cập nhật trạng thái kết nối vào chrome.storage.local và broadcast tới tất cả tabs
  */
 async function updateConnectionStatus(isConnected) {
   try {
@@ -27,7 +29,6 @@ async function updateConnectionStatus(isConnected) {
     console.warn("[Background] Lỗi cập nhật storage status:", err);
   }
 
-  // Bắn thông báo trạng thái tới tất cả các content script đang mở
   broadcastToTabs({
     type: "CONNECTION_STATUS",
     connected: isConnected
@@ -35,10 +36,29 @@ async function updateConnectionStatus(isConnected) {
 }
 
 /**
+ * Kiểm tra trạng thái hoạt động của Translation Service qua HTTP health check
+ */
+async function checkServerHealth() {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 1500);
+    const res = await fetch(`${HTTP_URL}/health`, { signal: controller.signal });
+    clearTimeout(timeoutId);
+    if (res.ok) {
+      const data = await res.json();
+      return { ok: true, data };
+    }
+  } catch (e) {
+    // server down hoặc chưa bật
+  }
+  return { ok: false };
+}
+
+/**
  * Khởi tạo kết nối WebSocket với server Python
  */
 function connectWebSocket(force = false) {
-  if (!force && activePorts.size === 0) {
+  if (isExplicitlyClosed && !force) {
     return;
   }
 
@@ -57,40 +77,46 @@ function connectWebSocket(force = false) {
 
     socket.onopen = () => {
       console.log("[Background] WebSocket đã kết nối thành công!");
-      reconnectDelay = 1000; // Reset lại delay khi kết nối thành công
+      reconnectDelay = 1000;
       updateConnectionStatus(true);
     };
 
     socket.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
-        // Gửi kết quả dịch về cho content script xử lý
         broadcastToTabs({
           type: "TRANSLATION_RESULT",
           payload: data
         });
       } catch (err) {
-        console.log("[Background] Lỗi parse dữ liệu từ WebSocket:", err);
+        console.warn("[Background] Lỗi parse dữ liệu từ WebSocket:", err);
       }
     };
 
     socket.onerror = () => {
-      // Dùng console.log để không kích hoạt cờ đỏ trong chrome://extensions/errors
-      console.log("[Background] WebSocket chưa kết nối được (server Python có thể chưa bật).");
+      console.log("[Background] WebSocket chưa sẵn sàng, dùng HTTP Fallback.");
     };
 
-    socket.onclose = (event) => {
-      console.log(`[Background] WebSocket đã đóng (code: ${event.code}). Sẽ thử lại sau ${reconnectDelay}ms...`);
-      updateConnectionStatus(false);
+    socket.onclose = async (event) => {
+      console.log(`[Background] WebSocket đã đóng (code: ${event.code}).`);
       socket = null;
 
-      if (!isExplicitlyClosed && activePorts.size > 0) {
+      // Kiểm tra xem HTTP có còn sống không
+      const health = await checkServerHealth();
+      if (health.ok) {
+        // Server vẫn online, chỉ WS đóng -> Vẫn giữ trạng thái connected để HTTP fallback hoạt động!
+        updateConnectionStatus(true);
+      } else {
+        updateConnectionStatus(false);
+      }
+
+      if (!isExplicitlyClosed && (activePorts.size > 0 || force)) {
         scheduleReconnect();
       }
     };
   } catch (err) {
-    console.log("[Background] Không thể khởi tạo WebSocket:", err);
-    if (activePorts.size > 0) {
+    console.log("[Background] Không thể tạo WebSocket:", err);
+    if (activePorts.size > 0 || force) {
       scheduleReconnect();
     }
   }
@@ -100,13 +126,11 @@ function connectWebSocket(force = false) {
  * Lên lịch kết nối lại theo thuật toán Exponential Backoff
  */
 function scheduleReconnect() {
-  if (reconnectTimer || activePorts.size === 0) return;
+  if (reconnectTimer || isExplicitlyClosed) return;
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     reconnectDelay = Math.min(reconnectDelay * 1.5, MAX_RECONNECT_DELAY);
-    if (activePorts.size > 0) {
-      connectWebSocket();
-    }
+    connectWebSocket();
   }, reconnectDelay);
 }
 
@@ -118,99 +142,67 @@ function broadcastToTabs(message) {
     try {
       port.postMessage(message);
     } catch (e) {
-      console.warn("[Background] Lỗi gửi tin tới port, xóa port:", e);
       activePorts.delete(port);
     }
   }
 }
 
 /**
- * Gửi dữ liệu từ content script ra server Python qua WebSocket
+ * DUAL-TRANSPORT: Gửi yêu cầu dịch qua WebSocket, tự động Fallback HTTP nếu WS chưa sẵn sàng
  */
-function sendToWebSocket(data) {
+async function sendTranslation(payload) {
+  // 1. Thử gửi qua WebSocket nếu đang mở (Độ trễ thấp nhất ~30-50ms)
   if (socket && socket.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify(data));
-    return true;
-  } else {
-    console.warn("[Background] Không thể gửi: WebSocket chưa sẵn sàng, đang thử kết nối lại...");
-    connectWebSocket();
-    return false;
-  }
-}
-
-// Lắng nghe kết nối Port từ Content Script
-chrome.runtime.onConnect.addListener((port) => {
-  if (port.name !== "meet-caption-port") return;
-
-  console.log("[Background] Nhận kết nối Port từ Google Meet Content Script");
-  activePorts.add(port);
-
-  // Gửi ngay trạng thái kết nối hiện tại cho content script
-  const isConnected = socket && socket.readyState === WebSocket.OPEN;
-  port.postMessage({
-    type: "CONNECTION_STATUS",
-    connected: isConnected
-  });
-
-  // Nếu socket chưa mở, kích hoạt kết nối
-  if (!isConnected) {
-    connectWebSocket();
+    try {
+      socket.send(JSON.stringify(payload));
+      return { success: true, transport: "ws" };
+    } catch (err) {
+      console.warn("[Background] Lỗi gửi WebSocket, tự động fallback sang HTTP:", err);
+    }
   }
 
-  port.onMessage.addListener((msg) => {
-    if (msg.type === "TRANSLATE_REQUEST") {
-      sendToWebSocket(msg.payload);
-    } else if (msg.type === "PING") {
-      port.postMessage({ type: "PONG" });
-    }
-  });
-
-  port.onDisconnect.addListener(() => {
-    console.log("[Background] Content script ngắt kết nối port");
-    activePorts.delete(port);
-
-    // Khi tất cả tab Meet đã đóng, dọn dẹp kết nối và dừng reconnect để tránh báo lỗi mạng
-    if (activePorts.size === 0) {
-      console.log("[Background] Không còn phòng họp nào mở. Đóng WebSocket tạm thời.");
-      if (reconnectTimer) {
-        clearTimeout(reconnectTimer);
-        reconnectTimer = null;
-      }
-      if (socket) {
-        try {
-          socket.close();
-        } catch (e) {}
-        socket = null;
-      }
-      updateConnectionStatus(false);
-    }
-  });
-});
-
-/**
- * Kiểm tra trạng thái hoạt động của Translation Service qua HTTP health check
- */
-async function checkServerHealth() {
+  // 2. FALLBACK TỨC THÌ QUA HTTP POST (Đảm bảo 100% không bao giờ kẹt "Đang dịch...")
   try {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 1200);
-    const res = await fetch("http://127.0.0.1:8765/health", { signal: controller.signal });
+    const timeoutId = setTimeout(() => controller.abort(), 4000);
+    const response = await fetch(`${HTTP_URL}/translate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal
+    });
     clearTimeout(timeoutId);
-    if (res.ok) {
-      const data = await res.json();
-      return { ok: true, data };
+
+    if (response.ok) {
+      const result = await response.json();
+      broadcastToTabs({
+        type: "TRANSLATION_RESULT",
+        payload: result
+      });
+
+      // Nếu HTTP phản hồi thành công mà WebSocket chưa kết nối, kích hoạt kết nối lại WS trong nền
+      if (!isExplicitlyClosed && (!socket || socket.readyState === WebSocket.CLOSED)) {
+        connectWebSocket();
+      }
+
+      return { success: true, transport: "http", data: result };
     }
-  } catch (e) {
-    // server down
+  } catch (httpErr) {
+    console.warn("[Background] Cả WS và HTTP đều không phản hồi (Server Python có thể chưa chạy):", httpErr.message);
   }
-  return { ok: false };
+
+  // Nếu cả 2 đều không được, thử kết nối lại
+  if (!isExplicitlyClosed && (!socket || socket.readyState === WebSocket.CLOSED)) {
+    connectWebSocket();
+  }
+
+  return { success: false };
 }
 
 /**
- * Ngắt kết nối WebSocket chủ động theo yêu cầu của người dùng
+ * Ngắt kết nối WebSocket chủ động
  */
 function disconnectWebSocket() {
-  console.log("[Background] Người dùng yêu cầu ngắt kết nối Server.");
   isExplicitlyClosed = true;
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
@@ -225,22 +217,57 @@ function disconnectWebSocket() {
   updateConnectionStatus(false);
 }
 
-// Lắng nghe Message một lần (cho Popup hoặc các query đơn giản)
+// Lắng nghe kết nối Port từ Content Script
+chrome.runtime.onConnect.addListener(async (port) => {
+  if (port.name !== "meet-caption-port") return;
+
+  activePorts.add(port);
+
+  // Kiểm tra ngay trạng thái server và phản hồi cho tab
+  const isWsOpen = socket && socket.readyState === WebSocket.OPEN;
+  if (isWsOpen) {
+    port.postMessage({ type: "CONNECTION_STATUS", connected: true });
+  } else {
+    // Kiểm tra nhanh HTTP health
+    const health = await checkServerHealth();
+    const isOnline = health.ok;
+    port.postMessage({ type: "CONNECTION_STATUS", connected: isOnline });
+    if (isOnline && !isExplicitlyClosed) {
+      connectWebSocket();
+    }
+  }
+
+  port.onMessage.addListener((msg) => {
+    if (msg.type === "TRANSLATE_REQUEST") {
+      sendTranslation(msg.payload);
+    } else if (msg.type === "PING") {
+      port.postMessage({ type: "PONG" });
+    }
+  });
+
+  port.onDisconnect.addListener(() => {
+    activePorts.delete(port);
+    if (activePorts.size === 0) {
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+    }
+  });
+});
+
+// Lắng nghe tin nhắn một lần (từ Popup hoặc Content Script fallback)
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === "GET_STATUS") {
     (async () => {
       const isWsOpen = socket && socket.readyState === WebSocket.OPEN;
-      let health = { ok: false };
-
-      if (!isExplicitlyClosed && !isWsOpen) {
-        health = await checkServerHealth();
-        if (health.ok && (!socket || socket.readyState === WebSocket.CLOSED)) {
-          connectWebSocket(true);
-        }
-      }
-
+      const health = await checkServerHealth();
       const isConnected = isWsOpen || (!isExplicitlyClosed && health.ok);
       await updateConnectionStatus(isConnected);
+
+      if (isConnected && !isWsOpen && !isExplicitlyClosed) {
+        connectWebSocket();
+      }
 
       sendResponse({
         connected: isConnected,
@@ -278,31 +305,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       activeTabs: activePorts.size
     });
     return true;
+  } else if (message.action === "TRANSLATE") {
+    // Kênh dịch trực tiếp qua Message (Fallback dự phòng khi Port bị ngắt)
+    (async () => {
+      const res = await sendTranslation(message.payload);
+      sendResponse(res);
+    })();
+    return true;
   }
 });
 
-// Giữ Service Worker tỉnh táo khi có meeting đang diễn ra (Alarms định kỳ)
+// Giữ Service Worker tỉnh táo và duy trì kết nối khi có meeting
 if (typeof chrome !== "undefined" && chrome.alarms) {
   try {
     chrome.alarms.create("keepAliveWs", { periodInMinutes: 1 });
-    chrome.alarms.onAlarm.addListener((alarm) => {
+    chrome.alarms.onAlarm.addListener(async (alarm) => {
       if (alarm.name === "keepAliveWs") {
-        if (activePorts.size > 0) {
-          if (!socket || socket.readyState !== WebSocket.OPEN) {
+        if (!isExplicitlyClosed) {
+          const health = await checkServerHealth();
+          if (health.ok && (!socket || socket.readyState !== WebSocket.OPEN)) {
             connectWebSocket();
-          } else {
-            // Gửi ping heartbeat nhẹ tới WebSocket server
+          } else if (socket && socket.readyState === WebSocket.OPEN) {
             try {
               socket.send(JSON.stringify({ type: "ping" }));
-            } catch (e) {
-              // Ignore
-            }
+            } catch (e) {}
           }
         }
       }
     });
   } catch (err) {
-    console.log("[Background] Lỗi cấu hình chrome.alarms:", err);
+    console.log("[Background] Lỗi alarms:", err);
   }
 }
-

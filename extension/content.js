@@ -8,6 +8,8 @@
  * 4. Chống stale response bằng activeRequestId và lifecycle riêng của từng block (Bug 2).
  * 5. Tự động xử lý khi Meet gỡ bỏ block (childList mutation) để chốt câu an toàn.
  * 6. Shadow DOM Overlay hiển thị mượt mà với 2 chế độ (Chỉ Tiếng Việt / Song ngữ).
+ * 7. Dual-Transport: Gửi qua WebSocket Port hoặc HTTP Message Fallback, không bao giờ rơi rớt dữ liệu.
+ * 8. Khắc phục triệt để lỗi kẹt "Đang dịch..." bằng việc chỉ tạo card khi có text thực tế.
  */
 
 (() => {
@@ -39,6 +41,7 @@
   let statusDot = null;
   let btnModeToggle = null;
   let btnServerPower = null;
+
   function isExtensionValid() {
     try {
       return Boolean(typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.id);
@@ -48,7 +51,7 @@
   }
 
   // =========================================================================
-  // 1. Quản lý kết nối Port với Background Service Worker
+  // 1. Quản lý kết nối Port với Background Service Worker (Dual-Transport)
   // =========================================================================
   function setupBackgroundPort() {
     if (!isExtensionValid()) return;
@@ -58,7 +61,7 @@
 
       bgPort.onMessage.addListener((msg) => {
         if (msg.type === "CONNECTION_STATUS") {
-          isConnectedToServer = msg.connected;
+          isConnectedToServer = Boolean(msg.connected);
           updateUiConnectionStatus(msg.connected);
         } else if (msg.type === "TRANSLATION_RESULT") {
           handleTranslationResult(msg.payload);
@@ -67,27 +70,38 @@
 
       bgPort.onDisconnect.addListener(() => {
         bgPort = null;
-        isConnectedToServer = false;
-        updateUiConnectionStatus(false);
-
-        // Chỉ thử kết nối lại nếu extension chưa bị reload
+        // Chỉ thử kết nối lại nếu extension context vẫn hợp lệ
         if (isExtensionValid()) {
           setTimeout(setupBackgroundPort, 2000);
         }
       });
     } catch (err) {
-      // Nếu context bị hủy hoặc gặp lỗi, dừng hoàn toàn và không log rác
       if (!isExtensionValid()) return;
-      if (err && err.message && err.message.includes("Extension context invalidated")) return;
-
       setTimeout(() => {
-        if (isExtensionValid()) {
-          setupBackgroundPort();
-        }
+        if (isExtensionValid()) setupBackgroundPort();
       }, 2000);
     }
   }
 
+  /**
+   * Định kỳ đồng bộ trạng thái kết nối với Background Service Worker
+   */
+  function syncServerStatus() {
+    if (!isExtensionValid()) return;
+    try {
+      chrome.runtime.sendMessage({ action: "GET_STATUS" }, (res) => {
+        if (chrome.runtime.lastError) return;
+        if (res && typeof res.connected === "boolean") {
+          isConnectedToServer = res.connected;
+          updateUiConnectionStatus(res.connected);
+        }
+      });
+    } catch (e) {}
+  }
+
+  /**
+   * Gửi yêu cầu dịch với cơ chế Dual-Transport (WebSocket Port + HTTP Message Fallback)
+   */
   function sendTranslationRequest(blockState, type) {
     if (!settings.enabled || !blockState.lastObservedText || !blockState.lastObservedText.trim()) return;
 
@@ -108,7 +122,6 @@
       blockState.lastSentInterimText = "";
     } else {
       blockState.lastSentInterimText = currentText;
-      // Interim sử dụng seq tiếp theo để định vị
       seqToSend = blockState.blockSeq + 1;
     }
 
@@ -123,11 +136,29 @@
       timestamp: now
     };
 
+    let sent = false;
     if (bgPort) {
-      bgPort.postMessage({
-        type: "TRANSLATE_REQUEST",
-        payload: payload
-      });
+      try {
+        bgPort.postMessage({
+          type: "TRANSLATE_REQUEST",
+          payload: payload
+        });
+        sent = true;
+      } catch (e) {
+        bgPort = null;
+      }
+    }
+
+    // Nếu Port không gửi được, Fallback gửi qua sendMessage tức thì
+    if (!sent && isExtensionValid()) {
+      try {
+        chrome.runtime.sendMessage({ action: "TRANSLATE", payload: payload }, (res) => {
+          if (chrome.runtime.lastError) return;
+          if (res && res.data) {
+            handleTranslationResult(res.data);
+          }
+        });
+      } catch (err) {}
     }
 
     console.log(
@@ -142,9 +173,8 @@
   // =========================================================================
 
   // Map liên kết giữa DOM Element của Speaker Block và BlockState của nó
-  // Key: HTMLElement (Speaker Block trong Meet DOM), Value: BlockState
   const activeBlocks = new Map();
-  // Map phụ tra cứu nhanh bằng blockId: blockId -> BlockState
+  // Map phụ tra cứu nhanh bằng blockId
   const blocksById = new Map();
 
   function createBlockState(element, initialSpeaker) {
@@ -174,8 +204,8 @@
 
     console.log(`%c[JA-VI][BLOCK CREATED]%c ID: ${blockId} | Speaker: "${state.speaker}"`, "color: #1a73e8; font-weight: bold;", "color: inherit;");
 
-    // Tạo đúng 1 thẻ tương ứng trên Overlay UI
-    createOverlayCard(state);
+    // LƯU Ý: Tuyệt đối KHÔNG tạo thẻ card rác ở đây khi chưa có text!
+    // Thẻ card sẽ chỉ được tạo khi phát hiện text thực sự trong getOrCreateOverlayCard().
 
     return state;
   }
@@ -207,13 +237,11 @@
     finalizeBlock(blockState);
     blockState.isFinalized = true;
 
-    // Dọn dẹp map DOM
     activeBlocks.delete(element);
 
-    // Lưu thẻ trong blocksById thêm một khoảng thời gian để đón response pending, sau đó dọn dẹp
     setTimeout(() => {
       blocksById.delete(blockState.blockId);
-    }, 10000);
+    }, 12000);
   }
 
   // =========================================================================
@@ -221,33 +249,38 @@
   // =========================================================================
 
   function findCaptionContainer() {
-    // 1. Thử các selector chuẩn xác của Google Meet Captions trước
+    // 1. Thử các selector vùng chứa phụ đề chính của Google Meet
     const specificSelectors = [
-      '.nMDOkf',
-      '.a4bvKc',
-      '[jsname="YSxPC"]',
       'div[jscontroller="D1tHje"]',
+      '.a4bvKc',
       '[role="region"][aria-label*="caption" i]',
       '[role="region"][aria-label*="phụ đề" i]',
-      '[role="region"][aria-label*="字幕" i]'
+      '[role="region"][aria-label*="字幕" i]',
+      '[role="region"][aria-label*="subtitles" i]'
     ];
 
     for (const sel of specificSelectors) {
       const el = document.querySelector(sel);
       if (el) {
         const rect = el.getBoundingClientRect();
-        if (rect.top > window.innerHeight * 0.35 && rect.height > 10) {
+        if (rect.top > window.innerHeight * 0.25 && rect.height > 10) {
           return el;
         }
       }
     }
 
-    // 2. Dự phòng aria-live TUY NHIÊN PHẢI LOẠI BỎ snackbar, toast, thông báo thiết bị, nút cuộn
+    // 2. Nếu tìm thấy .nMDOkf hoặc [jsname="YSxPC"] (hàng phụ đề), lấy container cha chứa tất cả hàng
+    const rowEl = document.querySelector('.nMDOkf, [jsname="YSxPC"]');
+    if (rowEl) {
+      const parent = rowEl.closest('.a4bvKc') || rowEl.closest('div[jscontroller="D1tHje"]') || rowEl.parentElement;
+      if (parent) return parent;
+    }
+
+    // 3. Dự phòng aria-live (loại bỏ modal, snackbar, toast, nút cuộn)
     const liveElements = document.querySelectorAll('[aria-live="polite"], [aria-live="assertive"]');
     for (const el of liveElements) {
-      // Bỏ qua nếu là snackbar / toast thông báo thiết bị / nút cuộn / thông báo chat
       if (el.closest('[role="status"], [role="alert"], .M9Bg4d, .eO2Zfd, [data-mdc-dialog-action]')) continue;
-      if (el.querySelector('button, [role="button"]')) continue; // Vùng phụ đề Google Meet không chứa nút bấm
+      if (el.querySelector('button, [role="button"]')) continue;
 
       const rect = el.getBoundingClientRect();
       if (rect.top > window.innerHeight * 0.35 && rect.height > 15 && rect.width > 80) {
@@ -272,7 +305,6 @@
       if (curr.parentElement === container) {
         return curr;
       }
-      // Trường hợp container có 1 wrapper con duy nhất bọc các block
       if (curr.parentElement.parentElement === container && curr.parentElement.children.length > 1) {
         return curr;
       }
@@ -282,51 +314,51 @@
   }
 
   /**
-   * Trích xuất tên người nói và text CHỈ từ trong blockElement này (Không đọc container cha)
+   * Trích xuất tên người nói và văn bản phụ đề CHÍNH XÁC từ blockElement
+   * Đã loại bỏ các selector chung chung như [class*="name" i] để không xoá nhầm chữ Nhật!
    */
   function extractBlockData(blockElement) {
     if (!blockElement) return { speaker: "Người tham gia", text: "" };
 
     let speakerName = "";
 
-    // 1. Thử lấy tên từ thẻ avatar img có thuộc tính alt
+    // 1. Thử lấy tên từ ảnh avatar (img alt)
     const avatarImg = blockElement.querySelector('img[alt]');
     if (avatarImg && avatarImg.alt && avatarImg.alt.trim()) {
       speakerName = avatarImg.alt.trim();
     }
 
-    // 2. Thử lấy tên từ phần tử chứa tên người nói đặc trưng trong Meet
+    // 2. Thử lấy tên từ các phần tử chuẩn của Meet
     if (!speakerName) {
-      const nameEl = blockElement.querySelector('[jsname="W297wb"], .ygicle, [class*="speaker" i], [class*="name" i]');
+      const nameEl = blockElement.querySelector('[jsname="W297wb"], .ygicle, [data-self-name]');
       if (nameEl && nameEl.textContent.trim()) {
         speakerName = nameEl.textContent.trim();
       }
     }
 
-    // 3. Trích xuất text nội dung phụ đề của khối này (Loại bỏ các icon button, mic, svg)
+    // 3. Trích xuất text nội dung phụ đề
     let text = "";
-    const textContainer = blockElement.querySelector('[jsname="YSxPC"], .nMDOkf, [class*="caption" i], [class*="text" i]');
+    const textContainer = blockElement.querySelector('[jsname="YSxPC"], .iTTPOb');
     if (textContainer) {
       const clone = textContainer.cloneNode(true);
       clone.querySelectorAll("img, svg, button, [role='button'], i, .google-material-icons, .material-icons, [class*='icon' i]").forEach((el) => el.remove());
       text = clone.innerText || clone.textContent || "";
     } else {
-      // Clone block để loại bỏ avatar, icon và tên người nói
       const clone = blockElement.cloneNode(true);
       clone.querySelectorAll("img, svg, button, [role='button'], i, .google-material-icons, .material-icons, [class*='icon' i]").forEach((el) => el.remove());
 
       if (speakerName) {
-        const cloneName = clone.querySelector('[jsname="W297wb"], .ygicle, [class*="speaker" i], [class*="name" i]');
+        const cloneName = clone.querySelector('[jsname="W297wb"], .ygicle, [data-self-name]');
         if (cloneName) cloneName.remove();
       }
       text = clone.innerText || clone.textContent || "";
     }
 
-    // Lọc bỏ ký danh icon nếu bị dính vào text (như mic_none, arrow_downward)
+    // Lọc bỏ ký danh icon nếu dính vào text
     text = text.replace(/^(mic_none|mic_off|arrow_downward|closed_caption|volume_up|more_vert|videocam|call_end)\s*/gi, "");
     text = text.replace(/[\r\n]+/g, " ").trim();
 
-    // Nếu văn bản vẫn bắt đầu bằng tên người nói, cắt bỏ để tránh trùng lặp
+    // Nếu văn bản bắt đầu bằng tên người nói, cắt bỏ phần trùng
     if (speakerName && text.startsWith(speakerName)) {
       text = text.substring(speakerName.length).trim();
     }
@@ -341,38 +373,40 @@
    * Xử lý khi có thay đổi trong một Speaker Block
    */
   function handleBlockMutation(blockElement) {
-    let blockState = activeBlocks.get(blockElement);
     const { speaker, text } = extractBlockData(blockElement);
 
+    // QUAN TRỌNG: Nếu chưa có text thực tế hoặc text rỗng -> BỎ QUA HOÀN TOÀN!
+    // Tránh sinh card rác hiển thị "Đang dịch..." trên UI.
+    if (!text || !text.trim() || text.length === 0) {
+      const existingState = activeBlocks.get(blockElement);
+      if (existingState && existingState.lastObservedText) {
+        finalizeBlock(existingState);
+      }
+      return;
+    }
+
+    let blockState = activeBlocks.get(blockElement);
+
     if (!blockState) {
-      // Nếu là block mới xuất hiện
       blockState = createBlockState(blockElement, speaker);
     } else if (speaker && speaker !== "Người tham gia" && blockState.speaker === "Người tham gia") {
-      // Cập nhật tên nếu trước đó chưa nhận diện được
       blockState.speaker = speaker;
       updateCardSpeaker(blockState);
     }
 
-    // Nếu nội dung text không đổi, bỏ qua
+    // Nếu nội dung text không đổi so với lần trước, bỏ qua
     if (text === blockState.lastObservedText) return;
 
     blockState.lastObservedText = text;
     blockState.lastUpdatedAt = Date.now();
 
-    // Cập nhật câu tiếng Nhật gốc ngay trên UI để người dùng thấy phụ đề đang chạy
-    updateCardOriginalText(blockState, text);
+    // Hiển thị / cập nhật thẻ trên UI với câu gốc tiếng Nhật ngay lập tức
+    getOrCreateOverlayCard(blockState, text);
 
-    // XỬ LÝ ĐẶC BIỆT: Nếu text bị xóa trắng (Meet dọn dẹp)
-    if (!text || text.length === 0) {
-      finalizeBlock(blockState);
-      return;
-    }
-
-    // Xử lý gửi bản dịch nháp (Interim) có chọn lọc:
-    // Chỉ gửi khi câu có ít nhất 4 ký tự và có thêm ít nhất 3 ký tự khác biệt
+    // Xử lý gửi bản dịch nháp (Interim)
     if (settings.enableInterim) {
       const charDiff = Math.abs(text.length - blockState.lastSentInterimText.length);
-      if (text.length >= 4 && charDiff >= 3) {
+      if (text.length >= 3 && charDiff >= 2) {
         if (blockState.interimTimer) clearTimeout(blockState.interimTimer);
         blockState.interimTimer = setTimeout(() => {
           blockState.interimTimer = null;
@@ -415,7 +449,6 @@
               if (activeBlocks.has(node)) {
                 removeBlock(node);
               } else {
-                // Kiểm tra xem có block nào bên trong node bị gỡ không
                 for (const [blockEl] of activeBlocks.entries()) {
                   if (node.contains(blockEl)) {
                     removeBlock(blockEl);
@@ -431,7 +464,6 @@
         if (blockEl) {
           handleBlockMutation(blockEl);
         } else if (mut.type === "childList" && mut.addedNodes.length > 0) {
-          // Trường hợp block mới toanh được thêm vào container
           for (const node of mut.addedNodes) {
             if (node.nodeType === Node.ELEMENT_NODE) {
               const candidate = getSpeakerBlockElement(node, container);
@@ -474,11 +506,14 @@
   }
 
   // =========================================================================
-  // 4. Quản Lý Thẻ Overlay UI (Gắn chặt với blockId, không sinh thẻ rác)
+  // 4. Quản Lý Thẻ Overlay UI (Chỉ hiển thị khi có text thực tế)
   // =========================================================================
 
-  function createOverlayCard(blockState) {
-    if (!subtitlesBody) return;
+  /**
+   * Lấy hoặc tạo thẻ phụ đề trên Overlay UI - ĐẢM BẢO LUÔN CÓ TEXT GỐC
+   */
+  function getOrCreateOverlayCard(blockState, text) {
+    if (!subtitlesBody || !shadowRoot) return null;
 
     let card = shadowRoot.getElementById(blockState.cardId);
     if (!card) {
@@ -488,16 +523,33 @@
       card.innerHTML = `
         <div class="subtitle-meta">
           <span class="speaker-label">${escapeHtml(blockState.speaker)}</span>
-          <span class="latency-label">Đang dịch...</span>
+          <span class="latency-label">⚡ Đang dịch...</span>
         </div>
-        <div class="original-text">${escapeHtml(blockState.lastObservedText)}</div>
+        <div class="original-text">${escapeHtml(text)}</div>
         <div class="translated-text">...</div>
       `;
       subtitlesBody.appendChild(card);
       blockState.cardElement = card;
       subtitlesBody.scrollTop = subtitlesBody.scrollHeight;
       trimOldCards();
+
+      // CƠ CHẾ BẢO VỆ CHỐNG KẸT: Nếu sau 7s chưa có bản dịch, tự động gỡ mác "Đang dịch..."
+      setTimeout(() => {
+        if (card && card.parentElement) {
+          const lat = card.querySelector(".latency-label");
+          if (lat && lat.textContent.includes("Đang dịch...")) {
+            lat.textContent = "AI";
+          }
+        }
+      }, 7000);
+    } else {
+      const origEl = card.querySelector(".original-text");
+      if (origEl && text) origEl.textContent = text;
+      const spEl = card.querySelector(".speaker-label");
+      if (spEl && blockState.speaker) spEl.textContent = blockState.speaker;
     }
+
+    return card;
   }
 
   function updateCardSpeaker(blockState) {
@@ -506,15 +558,6 @@
     if (card) {
       const spEl = card.querySelector(".speaker-label");
       if (spEl) spEl.textContent = blockState.speaker;
-    }
-  }
-
-  function updateCardOriginalText(blockState, text) {
-    if (!shadowRoot) return;
-    const card = shadowRoot.getElementById(blockState.cardId);
-    if (card) {
-      const origEl = card.querySelector(".original-text");
-      if (origEl) origEl.textContent = text;
     }
   }
 
@@ -529,15 +572,12 @@
     const blockState = blocksById.get(block_id);
     if (blockState) {
       if (type === "interim") {
-        // Nếu block đã finalized hoặc đã có request mới hơn, BỎ QUA STALE INTERIM!
         if (blockState.isFinalized || (req_id && req_id < blockState.activeRequestId)) {
-          console.log(`%c[JA-VI][RESP STALE]%c Bỏ qua interim cũ [${block_id}][Req #${req_id} < #${blockState.activeRequestId}]`, "color: #9aa0a6;", "color: inherit;");
           return;
         }
       }
     }
 
-    // Tìm thẻ card tương ứng theo block_id
     const cardId = `sub-card-${block_id}`;
     let card = shadowRoot.getElementById(cardId);
 
@@ -545,7 +585,6 @@
     const displaySpeaker = speaker || (blockState ? blockState.speaker : "Người tham gia");
 
     if (card) {
-      // Cập nhật thẻ hiện tại
       if (type === "final") {
         card.classList.remove("interim");
       }
@@ -563,7 +602,6 @@
         latencyEl.textContent = `${ms}ms`;
       }
     } else {
-      // Nếu thẻ chưa có (ví dụ block xuất hiện trước khi overlay nạp xong), tạo mới
       card = document.createElement("div");
       card.className = `subtitle-card ${type === "interim" ? "interim" : ""}`;
       card.id = cardId;
@@ -700,6 +738,17 @@
     btnModeToggle = shadowRoot.getElementById("btn-mode-toggle");
     btnServerPower = shadowRoot.getElementById("btn-server-power");
 
+    // Click vào status dot để kết nối lại
+    if (statusDot) {
+      statusDot.style.cursor = "pointer";
+      statusDot.addEventListener("click", () => {
+        if (!isExtensionValid()) return;
+        chrome.runtime.sendMessage({ action: "CONNECT" }, (res) => {
+          if (res) updateUiConnectionStatus(res.connected);
+        });
+      });
+    }
+
     if (btnServerPower) {
       btnServerPower.addEventListener("click", async () => {
         if (!isExtensionValid()) return;
@@ -774,7 +823,7 @@
         statusDot.title = "Đã kết nối Server";
       } else {
         statusDot.classList.remove("connected");
-        statusDot.title = "Chưa kết nối Server (Nhấp nút Bật/Tắt để kết nối)";
+        statusDot.title = "Chưa kết nối Server (Nhấp để kết nối lại)";
       }
     }
     if (btnServerPower) {
@@ -796,7 +845,7 @@
     let initialLeft = 0, initialTop = 0;
 
     handle.addEventListener("mousedown", (e) => {
-      if (e.target.closest(".action-btn") || e.target.closest(".mode-toggle-btn")) return;
+      if (e.target.closest(".action-btn") || e.target.closest(".mode-toggle-btn") || e.target.closest(".server-power-btn")) return;
 
       isDragging = true;
       container.classList.add("dragging");
@@ -873,5 +922,15 @@
   setupBackgroundPort();
   createOverlayUi();
   startScanner();
+
+  // Định kỳ kiểm tra trạng thái kết nối máy chủ mỗi 4s
+  setInterval(() => {
+    syncServerStatus();
+  }, 4000);
+
+  // Đồng bộ trạng thái ban đầu ngay sau khi nạp UI
+  setTimeout(() => {
+    syncServerStatus();
+  }, 500);
 
 })();

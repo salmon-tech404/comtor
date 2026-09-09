@@ -81,3 +81,8 @@ $RECYCLE.BIN/
 *.swp
 *.swo
 *~
+
+shashinkan-record-edited
+*.mp4
+*.webm
+*.mkv

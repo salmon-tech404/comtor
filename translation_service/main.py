@@ -15,6 +15,7 @@ import os
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from translator import TranslationEngine
 from cache_manager import TranslationCache
@@ -122,6 +123,68 @@ async def health_check():
         "compute_type": engine.compute_type,
         "cache_size": cache.size(),
         "model_dir": engine.model_dir
+    }
+
+
+class TranslateHttpPayload(BaseModel):
+    type: str = "final"
+    text: str = ""
+    session_id: str = "default"
+    block_id: str = "default"
+    req_id: int = 0
+    seq: int = 0
+    speaker: str = "Người tham gia"
+    timestamp: int = 0
+
+
+@app.post("/translate")
+async def http_translate(payload: TranslateHttpPayload):
+    """
+    Endpoint HTTP REST hỗ trợ Dual-Transport (Fallback dự phòng tức thì khi WebSocket chưa sẵn sàng)
+    """
+    text = payload.text.strip()
+    if not text:
+        return {
+            "type": payload.type,
+            "session_id": payload.session_id,
+            "block_id": payload.block_id,
+            "req_id": payload.req_id,
+            "seq": payload.seq,
+            "speaker": payload.speaker,
+            "original_text": "",
+            "translated_text": "",
+            "processing_time_ms": 0,
+            "timestamp": payload.timestamp
+        }
+
+    t_start = time.perf_counter()
+    cached_trans = cache.get(text)
+    is_cache_hit = False
+
+    if cached_trans is not None:
+        is_cache_hit = True
+        translated_text = cached_trans
+        inference_ms = 0.2
+    else:
+        translated_text, inference_ms = await asyncio.to_thread(engine.translate, text)
+        if payload.type == "final" and translated_text and not translated_text.startswith("["):
+            cache.set(text, translated_text)
+
+    total_proc_ms = (time.perf_counter() - t_start) * 1000.0
+    hit_str = " (CACHE HIT ⚡)" if is_cache_hit else ""
+    print(f"[HTTP {payload.type.upper()} #{payload.seq}][Blk: {payload.block_id}][{payload.speaker}] '{text[:30]}...' -> '{translated_text[:30]}...' [{total_proc_ms:.1f}ms{hit_str}]")
+
+    return {
+        "type": payload.type,
+        "session_id": payload.session_id,
+        "block_id": payload.block_id,
+        "req_id": payload.req_id,
+        "seq": payload.seq,
+        "speaker": payload.speaker,
+        "original_text": text,
+        "translated_text": translated_text,
+        "processing_time_ms": total_proc_ms,
+        "timestamp": payload.timestamp
     }
 
 
