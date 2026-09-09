@@ -268,6 +268,7 @@
     if (lineEl && !lineEl.closest("#gmeet-trans-host") && !lineEl.closest('[role="dialog"]')) {
       const container = lineEl.closest('.a4bvKc') || lineEl.closest('div[jscontroller="D1tHje"]') || lineEl.closest('.nMDOkf')?.parentElement;
       if (container && container !== document.body && !container.closest('[role="dialog"]')) {
+        console.log("[JA-VI][DEBUG] Container tìm thấy qua lineEl .iTTPOb:", container);
         return container;
       }
     }
@@ -277,6 +278,7 @@
     if (rowEl && !rowEl.closest("#gmeet-trans-host") && !rowEl.closest('[role="dialog"]')) {
       const parent = rowEl.closest('.a4bvKc') || rowEl.closest('div[jscontroller="D1tHje"]') || rowEl.parentElement;
       if (parent && parent !== document.body && !parent.closest('[role="dialog"]')) {
+        console.log("[JA-VI][DEBUG] Container tìm thấy qua rowEl .nMDOkf:", parent);
         return parent;
       }
     }
@@ -291,7 +293,33 @@
     for (const sel of regionSelectors) {
       const el = document.querySelector(sel);
       if (el && !el.closest("#gmeet-trans-host") && !el.closest('[role="dialog"]')) {
+        console.log("[JA-VI][DEBUG] Container tìm thấy qua region selector:", sel, el);
         return el;
+      }
+    }
+
+    // 5. Dynamic Scanner: Tự động tìm container bao bọc các phần tử lá chứa chữ tiếng Nhật thật sự
+    // Bảo đảm 100% tìm thấy ngay cả khi Google Meet thay đổi / mã hóa toàn bộ class name
+    const allLeafs = document.querySelectorAll('body *:not(script):not(style):not(dialog):not([role="dialog"]):not([role="menu"])');
+    for (const el of allLeafs) {
+      if (el.children.length === 0 && el.offsetHeight > 0 && JA_REGEX.test(el.textContent || "")) {
+        if (el.closest("#gmeet-trans-host")) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.top > window.innerHeight * 0.35 && rect.height > 5) {
+          let candidate = el.parentElement;
+          while (candidate && candidate !== document.body) {
+            if (candidate.classList.contains("a4bvKc") || candidate.classList.contains("nMDOkf") || candidate.hasAttribute("jscontroller") || candidate.getAttribute("role") === "region") {
+              const res = candidate.classList.contains("nMDOkf") ? (candidate.parentElement || candidate) : candidate;
+              console.log("[JA-VI][DEBUG] Container tìm thấy qua Dynamic Leaf Scanner (class):", res);
+              return res;
+            }
+            if (candidate.children.length > 1 && candidate.offsetHeight < 350 && candidate.getBoundingClientRect().top > window.innerHeight * 0.35) {
+              console.log("[JA-VI][DEBUG] Container tìm thấy qua Dynamic Leaf Scanner (structural parent):", candidate);
+              return candidate;
+            }
+            candidate = candidate.parentElement;
+          }
+        }
       }
     }
 
@@ -322,12 +350,9 @@
       if (innerList.length > 0) return innerList;
     }
 
-    // Nếu bản thân container là 1 speaker block duy nhất (ví dụ chỉ có 1 người trình bày)
-    if (list.length === 0 && container.offsetHeight > 0) {
-      const captionTextEl = container.querySelector('.iTTPOb, [jsname="tgaKEf"]');
-      if (captionTextEl && JA_REGEX.test(captionTextEl.textContent || "")) {
-        return [container];
-      }
+    // Nếu list rỗng nhưng chính container chứa phụ đề tiếng Nhật
+    if (list.length === 0 && container.offsetHeight > 0 && JA_REGEX.test(container.textContent || "")) {
+      return [container];
     }
 
     return list;
@@ -361,36 +386,50 @@
     const rawBlockText = blockElement.textContent || "";
     if (!speakerName) {
       if (/Bản trình bày của bạn|Your presentation|プレゼンテーション/i.test(rawBlockText)) {
-        speakerName = "Bản trình bày của bạn";
+        speakerName = "Your Presentation";
       }
     }
 
     let text = "";
 
     // 4. ƯU TIÊN SỐ 1: Bóc tách trực tiếp từ phần tử chứa dòng phụ đề của Meet (.iTTPOb, [jsname="tgaKEf"])
-    const captionEl = blockElement.querySelector('.iTTPOb, [jsname="tgaKEf"]');
+    const captionEl = blockElement.matches && blockElement.matches('.iTTPOb, [jsname="tgaKEf"]') 
+      ? blockElement 
+      : blockElement.querySelector('.iTTPOb, [jsname="tgaKEf"]');
+
     if (captionEl) {
       text = (captionEl.innerText || captionEl.textContent || "").trim();
     } else {
-      // 5. Dự phòng nếu không có class .iTTPOb: dùng clone nhưng loại trừ triệt để UI/scripts
-      const clone = blockElement.cloneNode(true);
-      clone.querySelectorAll(
-        "script, style, noscript, template, dialog, [role='dialog'], [role='menu'], [role='listbox'], [role='tooltip'], nav, header, img, svg, button, [role='button'], i, .google-material-icons, .material-icons, [class*='icon' i], [jsname='W297wb'], .ygicle, [data-self-name]"
-      ).forEach((el) => el.remove());
+      // 5. Tìm trực tiếp từ các phần tử lá chứa chữ Nhật bên trong blockElement (Bảo đảm 100% không trượt)
+      const jaLeafs = Array.from(blockElement.querySelectorAll('*')).filter(el => 
+        el.children.length === 0 && 
+        JA_REGEX.test(el.textContent || "") &&
+        !el.closest('button, [role="button"], script, style, [role="dialog"], [role="menu"]')
+      );
 
-      text = clone.innerText || clone.textContent || "";
-      text = text.replace(/^(mic_none|mic_off|arrow_downward|closed_caption|volume_up|more_vert|videocam|call_end)\s*/gi, "");
-      text = text.replace(/[\r\n]+/g, " ").trim();
-      text = text.replace(/^(Bản trình bày của bạn|Your presentation|プレゼンテーション)\s*[:：\-]?\s*/gi, "");
+      if (jaLeafs.length > 0) {
+        text = jaLeafs.map(el => el.textContent.trim()).join(" ").trim();
+      } else {
+        // 6. Dự phòng: dùng clone nhưng loại trừ triệt để UI/scripts
+        const clone = blockElement.cloneNode(true);
+        clone.querySelectorAll(
+          "script, style, noscript, template, dialog, [role='dialog'], [role='menu'], [role='listbox'], [role='tooltip'], nav, header, img, svg, button, [role='button'], i, .google-material-icons, .material-icons, [class*='icon' i], [jsname='W297wb'], .ygicle, [data-self-name]"
+        ).forEach((el) => el.remove());
 
-      if (speakerName && text.startsWith(speakerName) && text.length > speakerName.length) {
-        text = text.substring(speakerName.length).trim();
-      } else if (speakerName && text === speakerName) {
-        text = "";
+        text = clone.innerText || clone.textContent || "";
+        text = text.replace(/^(mic_none|mic_off|arrow_downward|closed_caption|volume_up|more_vert|videocam|call_end)\s*/gi, "");
+        text = text.replace(/[\r\n]+/g, " ").trim();
+        text = text.replace(/^(Bản trình bày của bạn|Your presentation|プレゼンテーション)\s*[:：\-]?\s*/gi, "");
+
+        if (speakerName && text.startsWith(speakerName) && text.length > speakerName.length) {
+          text = text.substring(speakerName.length).trim();
+        } else if (speakerName && text === speakerName) {
+          text = "";
+        }
       }
     }
 
-    // 6. BỘ LỌC BẢO VỆ CHỐNG RÁC HỆ THỐNG / SCRIPT NHÚNG:
+    // 7. BỘ LỌC BẢO VỆ CHỐNG RÁC HỆ THỐNG / SCRIPT NHÚNG:
     // Phụ đề là câu nói ngắn (dưới 350 ký tự), không bao giờ là mã nguồn hoặc danh sách cài đặt
     if (!text || text.length > 350 || text.length < 1) {
       return { speaker: speakerName || "Người tham gia", text: "" };
@@ -413,6 +452,8 @@
    */
   function handleBlockMutation(blockElement) {
     const { speaker, text } = extractBlockData(blockElement);
+
+    console.log("%c[JA-VI][DEBUG]%c handleBlockMutation gọi với element:", "color: #ff9800; font-weight: bold;", "color: inherit;", blockElement, "| speaker:", speaker, "| text:", JSON.stringify(text));
 
     // Nếu text trống: chốt câu cũ nếu đang có
     if (!text || !text.trim() || text.length === 0) {
@@ -521,6 +562,10 @@
     const blocks = getBlockList(container);
     const liveEls = new Set(blocks);
 
+    if (blocks.length > 0) {
+      console.log(`%c[JA-VI][DEBUG]%c scanAllBlocks tìm thấy ${blocks.length} block con:`, "color: #00bcd4;", "color: inherit;", blocks);
+    }
+
     for (const child of blocks) {
       handleBlockMutation(child);
     }
@@ -561,11 +606,18 @@
   }
 
   // Scanner định kỳ (mỗi 600ms) quét chủ động theo container thực tế
+  let lastScannerLogTime = 0;
   function startScanner() {
     setInterval(() => {
       if (!isExtensionValid()) return;
 
       const container = findCaptionContainer();
+      const now = Date.now();
+      if (now - lastScannerLogTime > 2500) {
+        lastScannerLogTime = now;
+        console.log("[JA-VI][DEBUG] Scanner tick, container hiện tại:", container, "| observedContainer:", observedContainer);
+      }
+
       if (container) {
         if (container !== observedContainer) {
           attachObserver(container);
