@@ -330,37 +330,31 @@
 
     // 2. Thử lấy tên từ các phần tử chuẩn của Meet
     if (!speakerName) {
-      const nameEl = blockElement.querySelector('[jsname="W297wb"], .ygicle, [data-self-name]');
+      const nameEl = blockElement.querySelector('[jsname="W297wb"], .ygicle, [data-self-name], [class*="speaker" i]');
       if (nameEl && nameEl.textContent.trim()) {
         speakerName = nameEl.textContent.trim();
       }
     }
 
-    // 3. Trích xuất text nội dung phụ đề
-    let text = "";
-    const textContainer = blockElement.querySelector('[jsname="YSxPC"], .iTTPOb');
-    if (textContainer) {
-      const clone = textContainer.cloneNode(true);
-      clone.querySelectorAll("img, svg, button, [role='button'], i, .google-material-icons, .material-icons, [class*='icon' i]").forEach((el) => el.remove());
-      text = clone.innerText || clone.textContent || "";
-    } else {
-      const clone = blockElement.cloneNode(true);
-      clone.querySelectorAll("img, svg, button, [role='button'], i, .google-material-icons, .material-icons, [class*='icon' i]").forEach((el) => el.remove());
+    // 3. LUÔN dùng phương án clone toàn khối duy nhất, không dò đoán textContainer
+    const clone = blockElement.cloneNode(true);
 
-      if (speakerName) {
-        const cloneName = clone.querySelector('[jsname="W297wb"], .ygicle, [data-self-name]');
-        if (cloneName) cloneName.remove();
-      }
-      text = clone.innerText || clone.textContent || "";
-    }
+    // Xóa tất cả ảnh, avatar, SVG, icons, nút bấm
+    clone.querySelectorAll("img, svg, button, [role='button'], i, .google-material-icons, .material-icons, [class*='icon' i]").forEach((el) => el.remove());
 
-    // Lọc bỏ ký danh icon nếu dính vào text
+    // Xóa các phần tử chứa tên người nói khỏi bản sao
+    clone.querySelectorAll('[jsname="W297wb"], .ygicle, [data-self-name], [class*="speaker" i]').forEach((el) => el.remove());
+
+    let text = clone.innerText || clone.textContent || "";
     text = text.replace(/^(mic_none|mic_off|arrow_downward|closed_caption|volume_up|more_vert|videocam|call_end)\s*/gi, "");
     text = text.replace(/[\r\n]+/g, " ").trim();
 
-    // Nếu văn bản bắt đầu bằng tên người nói, cắt bỏ phần trùng
-    if (speakerName && text.startsWith(speakerName)) {
+    // Chỉ cắt tên nếu phần còn lại vẫn còn nội dung (tránh vô tình làm rỗng)
+    if (speakerName && text.startsWith(speakerName) && text.length > speakerName.length) {
       text = text.substring(speakerName.length).trim();
+    } else if (speakerName && text === speakerName) {
+      // Nếu text sau khi lọc chỉ đúng bằng tên người nói -> Chưa có câu nói thực sự
+      text = "";
     }
 
     return {
